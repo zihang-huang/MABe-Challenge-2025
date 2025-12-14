@@ -211,3 +211,5 @@ data/
 .DS_Store
 
 *.code-workspace
+
+CLAUDE.md
