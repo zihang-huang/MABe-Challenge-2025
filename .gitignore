@@ -213,3 +213,5 @@ data/
 *.code-workspace
 
 CLAUDE.md
+
+*.pth
