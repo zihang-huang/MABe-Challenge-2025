@@ -27,7 +27,7 @@ from sklearn.metrics import (
     classification_report, confusion_matrix, f1_score,
     precision_recall_fscore_support
 )
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -77,7 +77,7 @@ class Config:
     STRIDE = 32  # Stride for sliding window
     BATCH_SIZE = 2048  # Increased for RTX 5090
     NUM_WORKERS = 8  # Parallel data loading
-    NUM_EPOCHS = 200
+    NUM_EPOCHS = 50
     LEARNING_RATE = 1e-3
     WEIGHT_DECAY = 1e-4
 
@@ -125,6 +125,7 @@ class DataProcessor:
         self.data_dir = data_dir
         self.config = config
         self.label_encoder = LabelEncoder()
+        self.scaler = StandardScaler()
         self.action_to_idx: Dict[str, int] = {}
         self.idx_to_action: Dict[int, str] = {}
         self.class_weights: Optional[torch.Tensor] = None
@@ -140,6 +141,10 @@ class DataProcessor:
 
         with open(meta_path, 'r') as f:
             metadata = json.load(f)
+
+        # Handle missing values with interpolation
+        numeric_cols = features.select_dtypes(include=[np.number]).columns
+        features[numeric_cols] = features[numeric_cols].interpolate(method='linear', limit_direction='both').fillna(0)
 
         return features, annotations, metadata
 
@@ -342,6 +347,12 @@ class DataProcessor:
                             self.config.SEQUENCE_LENGTH,
                             self.config.STRIDE
                         )
+                        
+                        # Partial fit scaler on new sequences
+                        if seqs:
+                            # Flatten sequences to [N*T, F] for scaling
+                            flat_seqs = np.concatenate(seqs, axis=0)
+                            self.scaler.partial_fit(flat_seqs)
 
                         all_sequences.extend(seqs)
                         all_labels.extend(labs)
@@ -357,15 +368,32 @@ class DataProcessor:
 
         print(f"Created {len(all_sequences)} sequences")
         print(f"Label distribution: {dict(label_counts.most_common(10))}...")
+        
+        # Apply scaling to all sequences
+        print("Applying feature scaling...")
+        for i in range(len(all_sequences)):
+            shape = all_sequences[i].shape
+            all_sequences[i] = self.scaler.transform(all_sequences[i].reshape(-1, shape[-1])).reshape(shape)
 
-        # Calculate class weights for imbalanced data
+        # Calculate class weights with log smoothing
         total_samples = sum(label_counts.values())
         num_classes = len(self.action_to_idx)
         class_weights = []
+        
+        print("Class weights:")
         for i in range(num_classes):
-            count = label_counts.get(i, 1)
-            weight = total_samples / (num_classes * count)
-            class_weights.append(min(weight, 10.0))  # Cap weights
+            count = label_counts.get(i, 0)
+            if count == 0:
+                weight = 1.0
+            else:
+                # Log-smoothed weighting: 1 + log(total / count)
+                # This reduces the penalty difference between frequent and rare classes
+                weight = 1.0 + np.log(total_samples / count)
+            
+            class_weights.append(weight)
+            if i < 10:  # Print first few weights
+                print(f"  Class {i} ({self.idx_to_action.get(i, '?')}): {weight:.4f} (count={count})")
+                
         self.class_weights = torch.FloatTensor(class_weights).to(DEVICE)
 
         return all_sequences, all_labels, all_video_ids
@@ -701,7 +729,7 @@ class Trainer:
             train_loss, train_f1 = self.train_epoch(train_loader)
 
             # Evaluate (every 25 epochs)
-            if (epoch + 1) % 25 == 0:
+            if (epoch + 1) % 5 == 0:
                 val_loss, val_f1, _, _ = self.evaluate(val_loader)
 
                 # Save best model

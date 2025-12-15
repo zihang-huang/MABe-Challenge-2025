@@ -3,37 +3,40 @@ Classification Report
 
                  precision    recall  f1-score   support
 
-    no_behavior       0.96      0.21      0.34   2137255
-      allogroom       0.00      0.00      0.00         0
-       approach       0.02      0.62      0.04      6958
-         attack       0.29      0.78      0.42     65316
-   attemptmount       0.05      0.02      0.03      1354
+    no_behavior       0.97      0.95      0.96   7360947
+      allogroom       0.00      0.00      0.00        60
+       approach       0.09      0.06      0.07     18716
+         attack       0.47      0.64      0.54     60682
+   attemptmount       0.00      0.00      0.00       328
           avoid       0.00      0.00      0.00         0
-          chase       0.00      0.00      0.00         0
-          climb       0.00      0.00      0.00         0
-         defend       0.05      0.90      0.09      2424
-            dig       0.00      0.00      0.00         0
-      disengage       0.05      0.50      0.08      2790
-      dominance       0.00      0.00      0.00         0
- dominancegroom       0.00      0.00      0.00       852
- dominancemount       0.04      0.19      0.07      1678
-         escape       0.04      0.61      0.08      3204
-         follow       0.15      0.57      0.24      6390
-         freeze       0.00      0.81      0.01        58
+     biteobject       0.00      0.00      0.00       102
+          chase       0.53      0.13      0.20      3088
+          climb       0.11      0.15      0.12     19140
+         defend       0.21      0.19      0.20      6906
+            dig       0.12      0.17      0.14     19836
+      disengage       0.05      0.06      0.06      4925
+      dominance       0.35      0.79      0.49      6052
+ dominancegroom       0.00      0.00      0.00         0
+ dominancemount       0.05      0.06      0.06      1033
+         escape       0.24      0.33      0.28      8080
+  exploreobject       0.00      0.00      0.00       754
+         flinch       0.00      0.00      0.00       420
+         follow       0.37      0.43      0.40      9058
+         freeze       0.00      0.00      0.00         0
    genitalgroom       0.00      0.00      0.00         0
-         huddle       0.01      0.81      0.03       666
-       intromit       0.49      0.89      0.63     26394
-          mount       0.45      0.58      0.51     54318
-           rear       0.09      0.48      0.16      5902
-reciprocalsniff       0.03      0.84      0.05      2484
-      selfgroom       0.09      0.84      0.17      5142
-       shepherd       0.00      0.00      0.00         0
-          sniff       0.51      0.29      0.37    557674
-      sniffbody       0.07      0.55      0.12     27084
-      sniffface       0.08      0.76      0.15     13682
-   sniffgenital       0.14      0.66      0.23    216743
+         huddle       0.20      0.74      0.32      5588
+       intromit       0.44      0.44      0.44     27586
+          mount       0.38      0.59      0.47     25076
+           rear       0.25      0.17      0.20     23696
+reciprocalsniff       0.33      0.64      0.44     19370
+      selfgroom       0.05      0.01      0.02     12551
+       shepherd       0.42      0.64      0.50     15508
+          sniff       0.48      0.61      0.54    375518
+      sniffbody       0.27      0.11      0.16     33304
+      sniffface       0.34      0.12      0.18     19058
+   sniffgenital       0.42      0.36      0.39    159482
          tussle       0.00      0.00      0.00         0
 
-       accuracy                           0.29   3138368
-      macro avg       0.12      0.40      0.13   3138368
-   weighted avg       0.77      0.29      0.34   3138368
+       accuracy                           0.90   8236864
+      macro avg       0.22      0.25      0.22   8236864
+   weighted avg       0.91      0.90      0.90   8236864
