@@ -1,0 +1,9 @@
+Pseudo-Labeling (Semi-Supervised)
+  If you have a lot of unlabelled data, you can use the model to teach itself.
+
+   * How it works:
+       1. Train the model on the small set of labelled data.
+       2. Run the model on the unlabelled segments.
+       3. If the model is very confident (e.g., > 95% probability) about a prediction, treat that prediction as a "ground truth"
+          label.
+       4. Retrain the model using both the real labels and these new "pseudo-labels."
