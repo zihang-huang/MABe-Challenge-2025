@@ -1,10 +1,4 @@
-"""
-Temporal Convolutional Network for Multi-Agent Mouse Behavior Classification
-MABe Challenge 2025
 
-This module implements a TCN-based model for classifying social and non-social
-behaviors in mice based on pose tracking data.
-"""
 
 import os
 import json
@@ -62,28 +56,32 @@ class Config:
         'acceleration', 'heading'
     ]
 
-    # Distance features will be added dynamically based on target
-    DISTANCE_COLS_TEMPLATE = ['dist_to_mouse_1', 'dist_to_mouse_2',
-                              'dist_to_mouse_3', 'dist_to_mouse_4']
-
     # Model architecture
-    INPUT_DIM = 32  # Will be calculated: agent_features + target_features + relative_features
+    # INPUT_DIM will be calculated dynamically
     NUM_CHANNELS = [64, 64, 128, 128, 256]  # TCN channel sizes
     KERNEL_SIZE = 5
-    DROPOUT = 0.3
+    DROPOUT = 0.4
 
     # Training
-    SEQUENCE_LENGTH = 64  # Temporal window size
+    SEQUENCE_LENGTH = 120  # Increased temporal window size
     STRIDE = 32  # Stride for sliding window
-    BATCH_SIZE = 2048  # Increased for RTX 5090
-    NUM_WORKERS = 8  # Parallel data loading
+    BATCH_SIZE = 1024
+    NUM_WORKERS = 8
     NUM_EPOCHS = 50
-    LEARNING_RATE = 1e-3
+    LEARNING_RATE = 5e-4
     WEIGHT_DECAY = 1e-4
+    
+    # Imbalance Handling
+    BACKGROUND_KEEP_PROB = 0.20  # Downsample 'no_behavior' to 20% during training
 
     # Evaluation
     VAL_SPLIT = 0.10
     TEST_SPLIT = 0.10
+
+    # Evaluation
+    VAL_SPLIT = 0.10
+    TEST_SPLIT = 0.10
+
 
 
 # =============================================================================
@@ -96,20 +94,20 @@ class BehaviorDataset(Dataset):
     def __init__(
         self,
         sequences: List[np.ndarray],
-        labels: List[np.ndarray],
-        sample_weights: Optional[List[float]] = None
+        labels: List[np.ndarray]
     ):
         """
         Args:
             sequences: List of feature sequences [T, F]
             labels: List of label sequences [T]
-            sample_weights: Optional sample weights for imbalanced data
         """
-        # Convert to tensors immediately to save CPU time during training
-        print("Converting dataset to tensors...")
-        self.sequences = torch.FloatTensor(np.array(sequences))
-        self.labels = torch.LongTensor(np.array(labels))
-        self.sample_weights = sample_weights
+        if len(sequences) > 0:
+            print(f"Converting {len(sequences)} sequences to tensors...")
+            self.sequences = torch.FloatTensor(np.array(sequences))
+            self.labels = torch.LongTensor(np.array(labels))
+        else:
+            self.sequences = torch.FloatTensor([])
+            self.labels = torch.LongTensor([])
 
     def __len__(self) -> int:
         return len(self.sequences)
@@ -124,7 +122,6 @@ class DataProcessor:
     def __init__(self, data_dir: Path, config: Config):
         self.data_dir = data_dir
         self.config = config
-        self.label_encoder = LabelEncoder()
         self.scaler = StandardScaler()
         self.action_to_idx: Dict[str, int] = {}
         self.idx_to_action: Dict[int, str] = {}
@@ -144,7 +141,8 @@ class DataProcessor:
 
         # Handle missing values with interpolation
         numeric_cols = features.select_dtypes(include=[np.number]).columns
-        features[numeric_cols] = features[numeric_cols].interpolate(method='linear', limit_direction='both').fillna(0)
+        features[numeric_cols] = features[numeric_cols].interpolate(
+            method='linear', limit_direction='both').fillna(0)
 
         return features, annotations, metadata
 
@@ -154,13 +152,7 @@ class DataProcessor:
         annotations: pd.DataFrame,
         num_frames: int
     ) -> Dict[Tuple[int, int], np.ndarray]:
-        """
-        Create per-frame labels for each agent-target pair.
-
-        Returns:
-            Dictionary mapping (agent_id, target_id) to frame-level labels
-        """
-        # Initialize with "no_behavior" (index 0)
+        """Create per-frame labels for each agent-target pair."""
         pair_labels = {}
 
         for _, row in annotations.iterrows():
@@ -172,10 +164,8 @@ class DataProcessor:
 
             key = (agent_id, target_id)
             if key not in pair_labels:
-                # Initialize with zeros (no behavior)
                 pair_labels[key] = np.zeros(num_frames, dtype=np.int64)
 
-            # Assign action label to frames
             if action in self.action_to_idx:
                 action_idx = self.action_to_idx[action]
                 pair_labels[key][start_frame:stop_frame+1] = action_idx
@@ -190,36 +180,22 @@ class DataProcessor:
     ) -> np.ndarray:
         """
         Extract combined features for an agent-target pair.
-
-        Features include:
-        - Agent pose and kinematic features
-        - Target pose and kinematic features
-        - Relative features (distance, relative position, etc.)
+        Includes agent features, target features, and relative kinematics.
         """
-        # Get agent and target data
         agent_data = features[features['mouse_id'] == agent_id].sort_values('video_frame')
         target_data = features[features['mouse_id'] == target_id].sort_values('video_frame')
 
         if len(agent_data) == 0 or len(target_data) == 0:
             return None
 
-        # Align by frame
-        frames = agent_data['video_frame'].values
-
-        # Extract agent features
+        # Extract basic features
         agent_features = agent_data[self.config.FEATURE_COLS].values
-
-        # Extract target features
         target_features = target_data[self.config.FEATURE_COLS].values
 
-        # Calculate relative features
+        # Relative position
         agent_nose = agent_data[['nose_x', 'nose_y']].values
         target_nose = target_data[['nose_x', 'nose_y']].values
-
-        # Relative position
         rel_pos = agent_nose - target_nose
-
-        # Distance between agents
         distance = np.sqrt(np.sum(rel_pos**2, axis=1, keepdims=True))
 
         # Relative heading
@@ -227,13 +203,27 @@ class DataProcessor:
         target_heading = target_data['heading'].values.reshape(-1, 1)
         rel_heading = agent_heading - target_heading
 
+        # Relative velocity
+        agent_vel = agent_data[['velocity_x', 'velocity_y']].values
+        target_vel = target_data[['velocity_x', 'velocity_y']].values
+        rel_vel = agent_vel - target_vel
+        rel_speed = np.sqrt(np.sum(rel_vel**2, axis=1, keepdims=True))
+
+        # Body elongation change (derivative)
+        # We compute this simply as diff, prepending 0 for the first frame
+        agent_elongation = agent_data['body_elongation'].values
+        agent_elongation_change = np.diff(agent_elongation, prepend=agent_elongation[0]).reshape(-1, 1)
+
         # Combine all features
         combined_features = np.concatenate([
             agent_features,      # Agent pose + kinematics
             target_features,     # Target pose + kinematics
             rel_pos,             # Relative position (x, y)
             distance,            # Distance
-            rel_heading          # Relative heading
+            rel_heading,         # Relative heading
+            rel_vel,             # Relative velocity (x, y)
+            rel_speed,           # Relative speed
+            agent_elongation_change # Change in body elongation
         ], axis=1)
 
         return combined_features
@@ -242,51 +232,39 @@ class DataProcessor:
         self,
         features: np.ndarray,
         labels: np.ndarray,
-        seq_length: int,
-        stride: int
+        downsample: bool
     ) -> Tuple[List[np.ndarray], List[np.ndarray]]:
-        """Create fixed-length sequences using sliding window."""
+        """
+        Create fixed-length sequences using sliding window.
+        Optionally downsample purely background sequences.
+        """
         sequences = []
         label_sequences = []
-
         num_frames = len(features)
 
-        for start in range(0, num_frames - seq_length + 1, stride):
-            end = start + seq_length
+        for start in range(0, num_frames - self.config.SEQUENCE_LENGTH + 1, self.config.STRIDE):
+            end = start + self.config.SEQUENCE_LENGTH
             seq = features[start:end]
             label_seq = labels[start:end]
 
-            # Skip sequences with too many NaN values
-            if np.isnan(seq).sum() / seq.size < 0.3:
-                # Fill remaining NaNs with interpolation or zeros
-                seq = np.nan_to_num(seq, nan=0.0)
-                sequences.append(seq)
-                label_sequences.append(label_seq)
+            # Quality check: Skip sequences with too many NaNs
+            if np.isnan(seq).sum() / seq.size > 0.3:
+                continue
+
+            # Downsampling: If sequence is purely background (0), keep with low probability
+            if downsample and np.all(label_seq == 0):
+                if np.random.random() > self.config.BACKGROUND_KEEP_PROB:
+                    continue
+
+            seq = np.nan_to_num(seq, nan=0.0)
+            sequences.append(seq)
+            label_sequences.append(label_seq)
 
         return sequences, label_sequences
 
-    def process_all_videos(
-        self,
-        max_videos: Optional[int] = None
-    ) -> Tuple[List[np.ndarray], List[np.ndarray], List[str]]:
-        """
-        Process all videos and create training sequences.
-
-        Returns:
-            sequences: List of feature sequences
-            labels: List of label sequences
-            video_ids: List of source video IDs
-        """
-        # Get all video IDs
-        video_files = [f.stem for f in self.data_dir.glob("*.parquet")
-                       if '_' not in f.stem]
-
-        if max_videos:
-            video_files = video_files[:max_videos]
-
-        print(f"Processing {len(video_files)} videos...")
-
-        # First pass: collect all actions
+    def prepare_classes(self, video_files: List[str]) -> None:
+        """Scan all annotations to build the class map."""
+        print("Scanning classes...")
         all_actions = set()
         for video_id in tqdm(video_files, desc="Collecting actions"):
             try:
@@ -294,45 +272,60 @@ class DataProcessor:
                 if annotations_path.exists():
                     annotations = pd.read_parquet(annotations_path)
                     all_actions.update(annotations['action'].unique())
-            except Exception as e:
+            except Exception:
                 continue
 
-        # Create action mapping (0 = no_behavior)
         all_actions = sorted(list(all_actions))
         self.action_to_idx = {action: idx + 1 for idx, action in enumerate(all_actions)}
         self.action_to_idx['no_behavior'] = 0
         self.idx_to_action = {idx: action for action, idx in self.action_to_idx.items()}
-
         print(f"Found {len(all_actions)} behavior classes (+ no_behavior)")
 
-        # Second pass: create sequences
+    def process_dataset(
+        self,
+        video_ids: List[str],
+        is_training: bool = False
+    ) -> Tuple[List[np.ndarray], List[np.ndarray], Counter]:
+        """
+        Process a specific list of videos.
+        
+        Args:
+            video_ids: List of video IDs to process
+            is_training: If True, fits scaler and downsamples background
+            
+        Returns:
+            sequences, labels, label_counts
+        """
         all_sequences = []
         all_labels = []
-        all_video_ids = []
         label_counts = Counter()
 
-        for video_id in tqdm(video_files, desc="Processing videos"):
+        desc = "Processing Train" if is_training else "Processing Eval"
+        
+        for video_id in tqdm(video_ids, desc=desc):
             try:
-                features, annotations, metadata = self.load_video_data(video_id)
-
-                # Get unique frames and mouse IDs
+                features, annotations, _ = self.load_video_data(video_id)
                 frames = features['video_frame'].unique()
-                num_frames = len(frames)
                 mouse_ids = features['mouse_id'].unique()
+                
+                pair_labels = self.create_frame_labels(features, annotations, len(frames))
 
-                # Create frame labels for each pair
-                pair_labels = self.create_frame_labels(features, annotations, num_frames)
-
-                # Process each agent-target pair
                 for agent_id in mouse_ids:
                     for target_id in mouse_ids:
+                        if agent_id == target_id: continue
+                        
+                        # Note: We process all pairs, but only those with annotations
+                        # or valid interactions will effectively have labels.
+                        # If a pair has no annotations, pair_labels[key] creates 0s.
                         key = (agent_id, target_id)
-
-                        # Only process pairs that have annotations
+                        
+                        # Optimization: Skip pairs that definitely have no interaction 
+                        # if we are just looking for behaviors. 
+                        # But for TCN we need context. 
+                        # Current logic: If create_frame_labels made an entry, use it.
                         if key not in pair_labels:
                             continue
 
-                        # Extract features
                         combined_features = self.extract_agent_target_features(
                             features, agent_id, target_id
                         )
@@ -340,63 +333,73 @@ class DataProcessor:
                         if combined_features is None:
                             continue
 
-                        # Create sequences
                         seqs, labs = self.create_sequences(
                             combined_features,
                             pair_labels[key],
-                            self.config.SEQUENCE_LENGTH,
-                            self.config.STRIDE
+                            downsample=is_training
                         )
                         
-                        # Partial fit scaler on new sequences
-                        if seqs:
-                            # Flatten sequences to [N*T, F] for scaling
+                        if not seqs:
+                            continue
+                            
+                        # Online scaler fitting (only during training)
+                        if is_training:
                             flat_seqs = np.concatenate(seqs, axis=0)
                             self.scaler.partial_fit(flat_seqs)
 
                         all_sequences.extend(seqs)
                         all_labels.extend(labs)
-                        all_video_ids.extend([video_id] * len(seqs))
-
-                        # Count labels
+                        
+                        # Count labels (for weighting)
                         for lab in labs:
                             label_counts.update(lab.tolist())
 
             except Exception as e:
-                print(f"Error processing video {video_id}: {e}")
+                # print(f"Error processing video {video_id}: {e}")
                 continue
 
-        print(f"Created {len(all_sequences)} sequences")
-        print(f"Label distribution: {dict(label_counts.most_common(10))}...")
-        
-        # Apply scaling to all sequences
-        print("Applying feature scaling...")
-        for i in range(len(all_sequences)):
-            shape = all_sequences[i].shape
-            all_sequences[i] = self.scaler.transform(all_sequences[i].reshape(-1, shape[-1])).reshape(shape)
+        # Transform all sequences
+        # Note: For training, we fit above. For val/test, we assume scaler is already fit.
+        if all_sequences:
+            print(f"Scaling {len(all_sequences)} sequences...")
+            for i in range(len(all_sequences)):
+                shape = all_sequences[i].shape
+                # Reshape to [N, F] for scaler, then back to [T, F]
+                # Check for infinite values before scaling
+                if not np.isfinite(all_sequences[i]).all():
+                     all_sequences[i] = np.nan_to_num(all_sequences[i], nan=0.0, posinf=0.0, neginf=0.0)
 
-        # Calculate class weights with log smoothing
+                scaled = self.scaler.transform(all_sequences[i].reshape(-1, shape[-1]))
+                all_sequences[i] = scaled.reshape(shape)
+
+        return all_sequences, all_labels, label_counts
+
+    def compute_class_weights(self, label_counts: Counter) -> torch.Tensor:
+        """
+        Compute class weights using 'balanced' strategy:
+        n_samples / (n_classes * np.bincount(y))
+        """
         total_samples = sum(label_counts.values())
         num_classes = len(self.action_to_idx)
-        class_weights = []
         
-        print("Class weights:")
-        for i in range(num_classes):
-            count = label_counts.get(i, 0)
-            if count == 0:
-                weight = 1.0
-            else:
-                # Log-smoothed weighting: 1 + log(total / count)
-                # This reduces the penalty difference between frequent and rare classes
-                weight = 1.0 + np.log(total_samples / count)
-            
-            class_weights.append(weight)
-            if i < 10:  # Print first few weights
-                print(f"  Class {i} ({self.idx_to_action.get(i, '?')}): {weight:.4f} (count={count})")
+        # Sort counts by class index to ensure correct order
+        counts = np.array([label_counts.get(i, 0) for i in range(num_classes)])
+        
+        # Avoid division by zero
+        counts = np.maximum(counts, 1)
+        
+        # Calculate balanced weights
+        weights = total_samples / (num_classes * counts)
+        
+        # Normalize weights so mean is 1.0 (keeps loss magnitude similar to unweighted)
+        weights = weights / weights.mean()
+        
+        print("Class weights (Balanced & Normalized):")
+        for i, weight in enumerate(weights):
+            if i < 10:
+                print(f"  Class {i}: {weight:.4f} (count={counts[i]})")
                 
-        self.class_weights = torch.FloatTensor(class_weights).to(DEVICE)
-
-        return all_sequences, all_labels, all_video_ids
+        return torch.FloatTensor(weights).to(DEVICE)
 
 
 # =============================================================================
@@ -405,14 +408,7 @@ class DataProcessor:
 
 class CausalConv1d(nn.Module):
     """Causal 1D convolution with padding to maintain sequence length."""
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int,
-        dilation: int = 1
-    ):
+    def __init__(self, in_channels, out_channels, kernel_size, dilation=1):
         super().__init__()
         self.padding = (kernel_size - 1) * dilation
         self.conv = nn.Conv1d(
@@ -420,8 +416,7 @@ class CausalConv1d(nn.Module):
             padding=self.padding, dilation=dilation
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Remove future padding to maintain causality
+    def forward(self, x):
         out = self.conv(x)
         if self.padding > 0:
             out = out[:, :, :-self.padding]
@@ -429,135 +424,66 @@ class CausalConv1d(nn.Module):
 
 
 class TemporalBlock(nn.Module):
-    """
-    Temporal block with dilated causal convolutions and residual connection.
-    """
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        kernel_size: int,
-        dilation: int,
-        dropout: float = 0.2
-    ):
+    """Temporal block with dilated causal convolutions and residual connection."""
+    def __init__(self, in_channels, out_channels, kernel_size, dilation, dropout=0.2):
         super().__init__()
-
-        self.conv1 = CausalConv1d(
-            in_channels, out_channels, kernel_size, dilation
-        )
-        self.conv2 = CausalConv1d(
-            out_channels, out_channels, kernel_size, dilation
-        )
-
+        self.conv1 = CausalConv1d(in_channels, out_channels, kernel_size, dilation)
         self.norm1 = nn.BatchNorm1d(out_channels)
-        self.norm2 = nn.BatchNorm1d(out_channels)
-
+        self.relu = nn.ReLU()
         self.dropout1 = nn.Dropout(dropout)
+
+        self.conv2 = CausalConv1d(out_channels, out_channels, kernel_size, dilation)
+        self.norm2 = nn.BatchNorm1d(out_channels)
+        self.relu = nn.ReLU()
         self.dropout2 = nn.Dropout(dropout)
 
-        # Residual connection
         self.downsample = nn.Conv1d(in_channels, out_channels, 1) \
             if in_channels != out_channels else None
 
-        self.relu = nn.ReLU()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # First conv block
+    def forward(self, x):
         out = self.conv1(x)
         out = self.norm1(out)
         out = self.relu(out)
         out = self.dropout1(out)
 
-        # Second conv block
         out = self.conv2(out)
         out = self.norm2(out)
         out = self.relu(out)
         out = self.dropout2(out)
 
-        # Residual connection
         res = x if self.downsample is None else self.downsample(x)
-
         return self.relu(out + res)
 
 
 class TemporalConvNet(nn.Module):
-    """
-    Temporal Convolutional Network for sequence classification.
-
-    Uses dilated causal convolutions with exponentially increasing
-    dilation rates to capture long-range temporal dependencies.
-    """
-
-    def __init__(
-        self,
-        input_dim: int,
-        num_channels: List[int],
-        kernel_size: int = 3,
-        dropout: float = 0.2
-    ):
+    """Temporal Convolutional Network."""
+    def __init__(self, input_dim, num_channels, kernel_size=3, dropout=0.2):
         super().__init__()
-
         layers = []
         num_levels = len(num_channels)
-
         for i in range(num_levels):
-            dilation = 2 ** i  # Exponential dilation
+            dilation = 2 ** i
             in_ch = input_dim if i == 0 else num_channels[i-1]
             out_ch = num_channels[i]
-
-            layers.append(TemporalBlock(
-                in_ch, out_ch, kernel_size, dilation, dropout
-            ))
-
+            layers.append(TemporalBlock(in_ch, out_ch, kernel_size, dilation, dropout))
         self.network = nn.Sequential(*layers)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: Input tensor [B, T, F] (batch, time, features)
-
-        Returns:
-            Output tensor [B, T, C] (batch, time, channels)
-        """
-        # TCN expects [B, C, T] format
-        x = x.transpose(1, 2)
+    def forward(self, x):
+        x = x.transpose(1, 2)  # [B, T, F] -> [B, F, T]
         out = self.network(x)
-        # Return to [B, T, C] format
-        return out.transpose(1, 2)
+        return out.transpose(1, 2)  # [B, F, T] -> [B, T, F]
 
 
 class BehaviorClassifier(nn.Module):
-    """
-    Complete model for behavior classification.
-
-    Combines TCN for temporal feature extraction with
-    classification heads for per-frame predictions.
-    """
-
-    def __init__(
-        self,
-        input_dim: int,
-        num_classes: int,
-        num_channels: List[int],
-        kernel_size: int = 3,
-        dropout: float = 0.2
-    ):
+    """Complete model for behavior classification."""
+    def __init__(self, input_dim, num_classes, num_channels, kernel_size=3, dropout=0.2):
         super().__init__()
-
-        # Input projection
         self.input_proj = nn.Sequential(
             nn.Linear(input_dim, num_channels[0]),
             nn.ReLU(),
             nn.Dropout(dropout)
         )
-
-        # Temporal convolutional network
-        self.tcn = TemporalConvNet(
-            num_channels[0], num_channels, kernel_size, dropout
-        )
-
-        # Classification head
+        self.tcn = TemporalConvNet(num_channels[0], num_channels, kernel_size, dropout)
         self.classifier = nn.Sequential(
             nn.Linear(num_channels[-1], num_channels[-1] // 2),
             nn.ReLU(),
@@ -565,23 +491,10 @@ class BehaviorClassifier(nn.Module):
             nn.Linear(num_channels[-1] // 2, num_classes)
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: Input tensor [B, T, F]
-
-        Returns:
-            Logits tensor [B, T, num_classes]
-        """
-        # Project input
+    def forward(self, x):
         x = self.input_proj(x)
-
-        # Temporal modeling
         x = self.tcn(x)
-
-        # Per-frame classification
         logits = self.classifier(x)
-
         return logits
 
 
@@ -591,133 +504,82 @@ class BehaviorClassifier(nn.Module):
 
 class Trainer:
     """Handles model training and evaluation."""
-
-    def __init__(
-        self,
-        model: nn.Module,
-        config: Config,
-        class_weights: Optional[torch.Tensor] = None
-    ):
+    def __init__(self, model, config, class_weights=None):
         self.model = model.to(DEVICE)
         self.config = config
 
-        # Loss function with class weights
+        # Use Standard Cross Entropy with Label Smoothing
         self.criterion = nn.CrossEntropyLoss(
-            weight=class_weights,
-            ignore_index=-1  # For masked positions
+            weight=class_weights, 
+            label_smoothing=0.1,
+            ignore_index=-1
         )
 
-        # Optimizer
         self.optimizer = AdamW(
             model.parameters(),
             lr=config.LEARNING_RATE,
             weight_decay=config.WEIGHT_DECAY
         )
-
-        # Learning rate scheduler
         self.scheduler = CosineAnnealingLR(
-            self.optimizer,
-            T_max=config.NUM_EPOCHS,
-            eta_min=1e-6
+            self.optimizer, T_max=config.NUM_EPOCHS, eta_min=1e-6
         )
-
-        # Mixed precision scaler
         self.scaler = GradScaler()
-
-        # Training history
         self.history = {
-            'train_loss': [],
-            'val_loss': [],
-            'train_f1': [],
-            'val_f1': [],
+            'train_loss': [], 'val_loss': [], 
+            'train_f1': [], 'val_f1': [], 
             'learning_rates': []
         }
 
-    def train_epoch(self, dataloader: DataLoader) -> Tuple[float, float]:
-        """Train for one epoch."""
+    def train_epoch(self, dataloader):
         self.model.train()
         total_loss = 0.0
-        all_preds = []
-        all_labels = []
+        all_preds, all_labels = [], []
 
         for sequences, labels in tqdm(dataloader, desc="Training", leave=False):
-            sequences = sequences.to(DEVICE)
-            labels = labels.to(DEVICE)
+            sequences, labels = sequences.to(DEVICE), labels.to(DEVICE)
 
-            # Forward pass with mixed precision
             self.optimizer.zero_grad()
-            
             with autocast():
                 logits = self.model(sequences)
-
-                # Compute loss (reshape for cross-entropy)
                 B, T, C = logits.shape
-                loss = self.criterion(
-                    logits.view(B * T, C),
-                    labels.view(B * T)
-                )
+                loss = self.criterion(logits.view(B * T, C), labels.view(B * T))
 
-            # Backward pass
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
             total_loss += loss.item()
-
-            # Collect predictions
             preds = logits.argmax(dim=-1).detach().cpu().numpy()
             all_preds.extend(preds.flatten())
             all_labels.extend(labels.cpu().numpy().flatten())
 
-        # Calculate metrics
         avg_loss = total_loss / len(dataloader)
         f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
-
         return avg_loss, f1
 
     @torch.no_grad()
-    def evaluate(self, dataloader: DataLoader) -> Tuple[float, float, np.ndarray, np.ndarray]:
-        """Evaluate on validation/test set."""
+    def evaluate(self, dataloader):
         self.model.eval()
         total_loss = 0.0
-        all_preds = []
-        all_labels = []
+        all_preds, all_labels = [], []
 
         for sequences, labels in tqdm(dataloader, desc="Evaluating", leave=False):
-            sequences = sequences.to(DEVICE)
-            labels = labels.to(DEVICE)
-
-            # Forward pass
+            sequences, labels = sequences.to(DEVICE), labels.to(DEVICE)
             logits = self.model(sequences)
-
-            # Compute loss
             B, T, C = logits.shape
-            loss = self.criterion(
-                logits.view(B * T, C),
-                labels.view(B * T)
-            )
+            loss = self.criterion(logits.view(B * T, C), labels.view(B * T))
             total_loss += loss.item()
-
-            # Collect predictions
             preds = logits.argmax(dim=-1).cpu().numpy()
             all_preds.extend(preds.flatten())
             all_labels.extend(labels.cpu().numpy().flatten())
 
-        avg_loss = total_loss / len(dataloader)
+        avg_loss = total_loss / len(dataloader) if len(dataloader) > 0 else 0
         f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
-
         return avg_loss, f1, np.array(all_preds), np.array(all_labels)
 
-    def train(
-        self,
-        train_loader: DataLoader,
-        val_loader: DataLoader,
-        num_epochs: int
-    ) -> Dict:
-        """Full training loop."""
+    def train(self, train_loader, val_loader, num_epochs):
         best_val_f1 = 0.0
         best_model_state = None
 
@@ -725,14 +587,10 @@ class Trainer:
             print(f"\nEpoch {epoch + 1}/{num_epochs}")
             print("-" * 50)
 
-            # Train
             train_loss, train_f1 = self.train_epoch(train_loader)
-
-            # Evaluate (every 25 epochs)
+            
             if (epoch + 1) % 5 == 0:
                 val_loss, val_f1, _, _ = self.evaluate(val_loader)
-
-                # Save best model
                 if val_f1 > best_val_f1:
                     best_val_f1 = val_f1
                     best_model_state = self.model.state_dict().copy()
@@ -740,11 +598,9 @@ class Trainer:
             else:
                 val_loss, val_f1 = np.nan, np.nan
 
-            # Update scheduler
             self.scheduler.step()
             current_lr = self.scheduler.get_last_lr()[0]
-
-            # Record history
+            
             self.history['train_loss'].append(train_loss)
             self.history['val_loss'].append(val_loss)
             self.history['train_f1'].append(train_f1)
@@ -756,10 +612,8 @@ class Trainer:
                 print(f"Val Loss: {val_loss:.4f} | Val F1: {val_f1:.4f}")
             print(f"Learning Rate: {current_lr:.6f}")
 
-        # Restore best model
         if best_model_state is not None:
             self.model.load_state_dict(best_model_state)
-
         return self.history
 
 
@@ -769,155 +623,46 @@ class Trainer:
 
 class Visualizer:
     """Handles visualization of results."""
-
     def __init__(self, output_dir: Path, idx_to_action: Dict[int, str]):
         self.output_dir = output_dir
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.idx_to_action = idx_to_action
 
     def plot_training_history(self, history: Dict) -> None:
-        """Plot training curves."""
         fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        
+        # Filter NaNs for plotting
+        val_loss = [x for x in history['val_loss'] if not np.isnan(x)]
+        val_f1 = [x for x in history['val_f1'] if not np.isnan(x)]
+        val_epochs = [i for i, x in enumerate(history['val_loss']) if not np.isnan(x)]
 
-        # Loss
         axes[0].plot(history['train_loss'], label='Train')
-        axes[0].plot(history['val_loss'], label='Validation')
-        axes[0].set_xlabel('Epoch')
-        axes[0].set_ylabel('Loss')
+        if val_loss:
+            axes[0].plot(val_epochs, val_loss, label='Validation', marker='o')
         axes[0].set_title('Training Loss')
         axes[0].legend()
-        axes[0].grid(True, alpha=0.3)
 
-        # F1 Score
         axes[1].plot(history['train_f1'], label='Train')
-        axes[1].plot(history['val_f1'], label='Validation')
-        axes[1].set_xlabel('Epoch')
-        axes[1].set_ylabel('F1 Score')
+        if val_f1:
+            axes[1].plot(val_epochs, val_f1, label='Validation', marker='o')
         axes[1].set_title('Macro F1 Score')
         axes[1].legend()
-        axes[1].grid(True, alpha=0.3)
 
-        # Learning Rate
         axes[2].plot(history['learning_rates'])
-        axes[2].set_xlabel('Epoch')
-        axes[2].set_ylabel('Learning Rate')
-        axes[2].set_title('Learning Rate Schedule')
-        axes[2].grid(True, alpha=0.3)
-
+        axes[2].set_title('Learning Rate')
+        
         plt.tight_layout()
-        plt.savefig(self.output_dir / 'training_history.png', dpi=150)
+        plt.savefig(self.output_dir / 'training_history.png')
         plt.close()
-        print(f"Saved training history plot to {self.output_dir / 'training_history.png'}")
 
-    def plot_confusion_matrix(
-        self,
-        y_true: np.ndarray,
-        y_pred: np.ndarray,
-        normalize: bool = True
-    ) -> None:
-        """Plot confusion matrix."""
-        # Get unique labels present in data
+    def save_classification_report(self, y_true, y_pred) -> str:
         unique_labels = sorted(set(y_true) | set(y_pred))
         label_names = [self.idx_to_action.get(i, f'class_{i}') for i in unique_labels]
-
-        cm = confusion_matrix(y_true, y_pred, labels=unique_labels)
-
-        if normalize:
-            cm = cm.astype('float') / (cm.sum(axis=1, keepdims=True) + 1e-8)
-
-        plt.figure(figsize=(14, 12))
-        sns.heatmap(
-            cm, annot=True, fmt='.2f' if normalize else 'd',
-            xticklabels=label_names, yticklabels=label_names,
-            cmap='Blues', square=True
-        )
-        plt.xlabel('Predicted')
-        plt.ylabel('True')
-        plt.title('Confusion Matrix (Normalized)' if normalize else 'Confusion Matrix')
-        plt.xticks(rotation=45, ha='right')
-        plt.yticks(rotation=0)
-        plt.tight_layout()
-        plt.savefig(self.output_dir / 'confusion_matrix.png', dpi=150)
-        plt.close()
-        print(f"Saved confusion matrix to {self.output_dir / 'confusion_matrix.png'}")
-
-    def plot_per_class_metrics(
-        self,
-        y_true: np.ndarray,
-        y_pred: np.ndarray
-    ) -> None:
-        """Plot per-class precision, recall, and F1."""
-        unique_labels = sorted(set(y_true) | set(y_pred))
-        label_names = [self.idx_to_action.get(i, f'class_{i}') for i in unique_labels]
-
-        precision, recall, f1, support = precision_recall_fscore_support(
-            y_true, y_pred, labels=unique_labels, zero_division=0
-        )
-
-        # Create DataFrame for plotting
-        metrics_df = pd.DataFrame({
-            'Class': label_names,
-            'Precision': precision,
-            'Recall': recall,
-            'F1-Score': f1,
-            'Support': support
-        })
-
-        # Sort by F1 score
-        metrics_df = metrics_df.sort_values('F1-Score', ascending=True)
-
-        fig, axes = plt.subplots(1, 2, figsize=(14, 8))
-
-        # Bar plot of metrics
-        x = np.arange(len(metrics_df))
-        width = 0.25
-
-        axes[0].barh(x - width, metrics_df['Precision'], width, label='Precision', alpha=0.8)
-        axes[0].barh(x, metrics_df['F1-Score'], width, label='F1-Score', alpha=0.8)
-        axes[0].barh(x + width, metrics_df['Recall'], width, label='Recall', alpha=0.8)
-        axes[0].set_yticks(x)
-        axes[0].set_yticklabels(metrics_df['Class'])
-        axes[0].set_xlabel('Score')
-        axes[0].set_title('Per-Class Metrics')
-        axes[0].legend()
-        axes[0].grid(True, alpha=0.3, axis='x')
-
-        # Support distribution
-        axes[1].barh(x, metrics_df['Support'], alpha=0.8, color='green')
-        axes[1].set_yticks(x)
-        axes[1].set_yticklabels(metrics_df['Class'])
-        axes[1].set_xlabel('Number of Samples')
-        axes[1].set_title('Class Distribution (Support)')
-        axes[1].grid(True, alpha=0.3, axis='x')
-
-        plt.tight_layout()
-        plt.savefig(self.output_dir / 'per_class_metrics.png', dpi=150)
-        plt.close()
-        print(f"Saved per-class metrics to {self.output_dir / 'per_class_metrics.png'}")
-
-    def save_classification_report(
-        self,
-        y_true: np.ndarray,
-        y_pred: np.ndarray
-    ) -> str:
-        """Generate and save classification report."""
-        unique_labels = sorted(set(y_true) | set(y_pred))
-        label_names = [self.idx_to_action.get(i, f'class_{i}') for i in unique_labels]
-
         report = classification_report(
-            y_true, y_pred,
-            labels=unique_labels,
-            target_names=label_names,
-            zero_division=0
+            y_true, y_pred, labels=unique_labels, target_names=label_names, zero_division=0
         )
-
-        report_path = self.output_dir / 'classification_report.txt'
-        with open(report_path, 'w') as f:
-            f.write("Classification Report\n")
-            f.write("=" * 80 + "\n\n")
+        with open(self.output_dir / 'classification_report.txt', 'w') as f:
             f.write(report)
-
-        print(f"Saved classification report to {report_path}")
         return report
 
 
@@ -926,102 +671,62 @@ class Visualizer:
 # =============================================================================
 
 def main():
-    """Main training pipeline."""
     print("=" * 60)
-    print("TCN Behavior Classification Model")
+    print("TCN Behavior Classification Model - Improved")
     print("MABe Challenge 2025")
     print("=" * 60)
 
     config = Config()
-
-    # Create output directory
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    # ==========================================================================
-    # Data Processing
-    # ==========================================================================
-    print("\n[1/5] Loading and processing data...")
-
     processor = DataProcessor(config.DATA_DIR, config)
 
-    # Process videos (limit for faster testing, remove for full training)
-    sequences, labels, video_ids = processor.process_all_videos()
-
-    if len(sequences) == 0:
-        print("No sequences created. Check data paths and format.")
+    # 1. Get all videos and prepare classes
+    video_files = [f.stem for f in config.DATA_DIR.glob("*.parquet") if '_' not in f.stem]
+    if not video_files:
+        print("No data found!")
         return
 
-    # Get input dimension from data
-    input_dim = sequences[0].shape[1]
+    processor.prepare_classes(video_files)
     num_classes = len(processor.action_to_idx)
+    
+    # 2. Split videos FIRST
+    print("\n[Split] Splitting videos into Train/Val/Test...")
+    train_vids, test_vids = train_test_split(video_files, test_size=config.VAL_SPLIT + config.TEST_SPLIT, random_state=SEED)
+    val_vids, test_vids = train_test_split(test_vids, test_size=0.5, random_state=SEED) # Equal split for val/test
+    
+    print(f"Train videos: {len(train_vids)}")
+    print(f"Val videos:   {len(val_vids)}")
+    print(f"Test videos:  {len(test_vids)}")
 
-    print(f"Input dimension: {input_dim}")
-    print(f"Number of classes: {num_classes}")
-    print(f"Total sequences: {len(sequences)}")
+    # 3. Process datasets independently
+    # Train: Fit scaler, downsample background
+    print("\n[Train Data] Processing...")
+    train_seqs, train_labels, train_counts = processor.process_dataset(train_vids, is_training=True)
+    
+    # Val/Test: Transform scaler, keep all data
+    print("\n[Val Data] Processing...")
+    val_seqs, val_labels, _ = processor.process_dataset(val_vids, is_training=False)
+    
+    print("\n[Test Data] Processing...")
+    test_seqs, test_labels, _ = processor.process_dataset(test_vids, is_training=False)
 
-    # ==========================================================================
-    # Train/Val/Test Split
-    # ==========================================================================
-    print("\n[2/5] Splitting data...")
+    if len(train_seqs) == 0:
+        print("Error: No training data generated.")
+        return
 
-    # Split by video to prevent data leakage
-    unique_videos = list(set(video_ids))
-    train_videos, temp_videos = train_test_split(
-        unique_videos,
-        test_size=config.VAL_SPLIT + config.TEST_SPLIT,
-        random_state=SEED
-    )
-    val_videos, test_videos = train_test_split(
-        temp_videos,
-        test_size=config.TEST_SPLIT / (config.VAL_SPLIT + config.TEST_SPLIT),
-        random_state=SEED
-    )
+    # 4. Create Datasets and Loaders
+    train_dataset = BehaviorDataset(train_seqs, train_labels)
+    val_dataset = BehaviorDataset(val_seqs, val_labels)
+    test_dataset = BehaviorDataset(test_seqs, test_labels)
 
-    # Create split indices
-    train_indices = [i for i, vid in enumerate(video_ids) if vid in train_videos]
-    val_indices = [i for i, vid in enumerate(video_ids) if vid in val_videos]
-    test_indices = [i for i, vid in enumerate(video_ids) if vid in test_videos]
+    train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, num_workers=config.NUM_WORKERS)
+    val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=config.NUM_WORKERS)
+    test_loader = DataLoader(test_dataset, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=config.NUM_WORKERS)
 
-    print(f"Train: {len(train_indices)} sequences from {len(train_videos)} videos")
-    print(f"Val: {len(val_indices)} sequences from {len(val_videos)} videos")
-    print(f"Test: {len(test_indices)} sequences from {len(test_videos)} videos")
-
-    # Create datasets
-    train_dataset = BehaviorDataset(
-        [sequences[i] for i in train_indices],
-        [labels[i] for i in train_indices]
-    )
-    val_dataset = BehaviorDataset(
-        [sequences[i] for i in val_indices],
-        [labels[i] for i in val_indices]
-    )
-    test_dataset = BehaviorDataset(
-        [sequences[i] for i in test_indices],
-        [labels[i] for i in test_indices]
-    )
-
-    # Create dataloaders
-    train_loader = DataLoader(
-        train_dataset, batch_size=config.BATCH_SIZE,
-        shuffle=True, num_workers=config.NUM_WORKERS,
-        pin_memory=True, persistent_workers=True if config.NUM_WORKERS > 0 else False
-    )
-    val_loader = DataLoader(
-        val_dataset, batch_size=config.BATCH_SIZE,
-        shuffle=False, num_workers=config.NUM_WORKERS,
-        pin_memory=True, persistent_workers=True if config.NUM_WORKERS > 0 else False
-    )
-    test_loader = DataLoader(
-        test_dataset, batch_size=config.BATCH_SIZE,
-        shuffle=False, num_workers=config.NUM_WORKERS,
-        pin_memory=True, persistent_workers=True if config.NUM_WORKERS > 0 else False
-    )
-
-    # ==========================================================================
-    # Model Initialization
-    # ==========================================================================
-    print("\n[3/5] Initializing model...")
-
+    # 5. Initialize Model
+    input_dim = train_seqs[0].shape[1]
+    print(f"\nInput dimension: {input_dim}")
+    
     model = BehaviorClassifier(
         input_dim=input_dim,
         num_classes=num_classes,
@@ -1030,60 +735,32 @@ def main():
         dropout=config.DROPOUT
     )
 
-    # Count parameters
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
-
-    # ==========================================================================
-    # Training
-    # ==========================================================================
-    print("\n[4/5] Training model...")
-
-    trainer = Trainer(model, config, processor.class_weights)
+    # 6. Train
+    print("\nStarting Training...")
+    # Calculate weights based on the downsampled training data
+    # class_weights = processor.compute_class_weights(train_counts)
+    print("WARNING: Disabling class weights to debug exploding loss.")
+    class_weights = None
+    
+    trainer = Trainer(model, config, class_weights)
     history = trainer.train(train_loader, val_loader, config.NUM_EPOCHS)
 
-    # Save model
+    # 7. Save
     model_path = config.OUTPUT_DIR / 'tcn_behavior_model.pt'
     torch.save({
         'model_state_dict': model.state_dict(),
-        'config': {
-            'input_dim': input_dim,
-            'num_classes': num_classes,
-            'num_channels': config.NUM_CHANNELS,
-            'kernel_size': config.KERNEL_SIZE,
-            'dropout': config.DROPOUT
-        },
-        'action_to_idx': processor.action_to_idx,
-        'idx_to_action': processor.idx_to_action
+        'config': vars(config),
+        'action_to_idx': processor.action_to_idx
     }, model_path)
-    print(f"Saved model to {model_path}")
-
-    # ==========================================================================
-    # Evaluation
-    # ==========================================================================
-    print("\n[5/5] Evaluating model...")
-
-    test_loss, test_f1, test_preds, test_labels = trainer.evaluate(test_loader)
-    print(f"\nTest Loss: {test_loss:.4f}")
+    
+    # 8. Evaluate
+    print("\nFinal Evaluation on Test Set...")
+    _, test_f1, test_preds, test_true = trainer.evaluate(test_loader)
     print(f"Test Macro F1: {test_f1:.4f}")
-
-    # Visualization
+    
     visualizer = Visualizer(config.OUTPUT_DIR, processor.idx_to_action)
     visualizer.plot_training_history(history)
-    visualizer.plot_confusion_matrix(test_labels, test_preds)
-    visualizer.plot_per_class_metrics(test_labels, test_preds)
-    report = visualizer.save_classification_report(test_labels, test_preds)
-
-    print("\n" + "=" * 60)
-    print("Training Complete!")
-    print("=" * 60)
-    print(f"\nResults saved to: {config.OUTPUT_DIR}")
-    print("\nClassification Report:")
-    print(report)
-
-    return model, processor, history
+    print(visualizer.save_classification_report(test_true, test_preds))
 
 
 if __name__ == "__main__":
