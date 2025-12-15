@@ -20,6 +20,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.cuda.amp import autocast, GradScaler
 
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
@@ -74,8 +75,9 @@ class Config:
     # Training
     SEQUENCE_LENGTH = 64  # Temporal window size
     STRIDE = 32  # Stride for sliding window
-    BATCH_SIZE = 64
-    NUM_EPOCHS = 50
+    BATCH_SIZE = 2048  # Increased for RTX 5090
+    NUM_WORKERS = 8  # Parallel data loading
+    NUM_EPOCHS = 200
     LEARNING_RATE = 1e-3
     WEIGHT_DECAY = 1e-4
 
@@ -103,17 +105,17 @@ class BehaviorDataset(Dataset):
             labels: List of label sequences [T]
             sample_weights: Optional sample weights for imbalanced data
         """
-        self.sequences = sequences
-        self.labels = labels
+        # Convert to tensors immediately to save CPU time during training
+        print("Converting dataset to tensors...")
+        self.sequences = torch.FloatTensor(np.array(sequences))
+        self.labels = torch.LongTensor(np.array(labels))
         self.sample_weights = sample_weights
 
     def __len__(self) -> int:
         return len(self.sequences)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        seq = torch.FloatTensor(self.sequences[idx])
-        label = torch.LongTensor(self.labels[idx])
-        return seq, label
+        return self.sequences[idx], self.labels[idx]
 
 
 class DataProcessor:
@@ -591,6 +593,9 @@ class Trainer:
             eta_min=1e-6
         )
 
+        # Mixed precision scaler
+        self.scaler = GradScaler()
+
         # Training history
         self.history = {
             'train_loss': [],
@@ -611,26 +616,31 @@ class Trainer:
             sequences = sequences.to(DEVICE)
             labels = labels.to(DEVICE)
 
-            # Forward pass
+            # Forward pass with mixed precision
             self.optimizer.zero_grad()
-            logits = self.model(sequences)
+            
+            with autocast():
+                logits = self.model(sequences)
 
-            # Compute loss (reshape for cross-entropy)
-            B, T, C = logits.shape
-            loss = self.criterion(
-                logits.view(B * T, C),
-                labels.view(B * T)
-            )
+                # Compute loss (reshape for cross-entropy)
+                B, T, C = logits.shape
+                loss = self.criterion(
+                    logits.view(B * T, C),
+                    labels.view(B * T)
+                )
 
             # Backward pass
-            loss.backward()
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.optimizer.step()
+            
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
 
             total_loss += loss.item()
 
             # Collect predictions
-            preds = logits.argmax(dim=-1).cpu().numpy()
+            preds = logits.argmax(dim=-1).detach().cpu().numpy()
             all_preds.extend(preds.flatten())
             all_labels.extend(labels.cpu().numpy().flatten())
 
@@ -690,8 +700,17 @@ class Trainer:
             # Train
             train_loss, train_f1 = self.train_epoch(train_loader)
 
-            # Evaluate
-            val_loss, val_f1, _, _ = self.evaluate(val_loader)
+            # Evaluate (every 25 epochs)
+            if (epoch + 1) % 25 == 0:
+                val_loss, val_f1, _, _ = self.evaluate(val_loader)
+
+                # Save best model
+                if val_f1 > best_val_f1:
+                    best_val_f1 = val_f1
+                    best_model_state = self.model.state_dict().copy()
+                    print(f"New best model! Val F1: {best_val_f1:.4f}")
+            else:
+                val_loss, val_f1 = np.nan, np.nan
 
             # Update scheduler
             self.scheduler.step()
@@ -705,14 +724,9 @@ class Trainer:
             self.history['learning_rates'].append(current_lr)
 
             print(f"Train Loss: {train_loss:.4f} | Train F1: {train_f1:.4f}")
-            print(f"Val Loss: {val_loss:.4f} | Val F1: {val_f1:.4f}")
+            if not np.isnan(val_loss):
+                print(f"Val Loss: {val_loss:.4f} | Val F1: {val_f1:.4f}")
             print(f"Learning Rate: {current_lr:.6f}")
-
-            # Save best model
-            if val_f1 > best_val_f1:
-                best_val_f1 = val_f1
-                best_model_state = self.model.state_dict().copy()
-                print(f"New best model! Val F1: {best_val_f1:.4f}")
 
         # Restore best model
         if best_model_state is not None:
@@ -961,15 +975,18 @@ def main():
     # Create dataloaders
     train_loader = DataLoader(
         train_dataset, batch_size=config.BATCH_SIZE,
-        shuffle=True, num_workers=0, pin_memory=True
+        shuffle=True, num_workers=config.NUM_WORKERS,
+        pin_memory=True, persistent_workers=True if config.NUM_WORKERS > 0 else False
     )
     val_loader = DataLoader(
         val_dataset, batch_size=config.BATCH_SIZE,
-        shuffle=False, num_workers=0, pin_memory=True
+        shuffle=False, num_workers=config.NUM_WORKERS,
+        pin_memory=True, persistent_workers=True if config.NUM_WORKERS > 0 else False
     )
     test_loader = DataLoader(
         test_dataset, batch_size=config.BATCH_SIZE,
-        shuffle=False, num_workers=0, pin_memory=True
+        shuffle=False, num_workers=config.NUM_WORKERS,
+        pin_memory=True, persistent_workers=True if config.NUM_WORKERS > 0 else False
     )
 
     # ==========================================================================
