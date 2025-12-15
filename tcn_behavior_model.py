@@ -59,7 +59,7 @@ class Config:
     # Model architecture
     # INPUT_DIM will be calculated dynamically
     NUM_CHANNELS = [64, 64, 128, 128, 256]  # TCN channel sizes
-    KERNEL_SIZE = 5
+    KERNEL_SIZE = 7
     DROPOUT = 0.4
 
     # Training
@@ -68,11 +68,11 @@ class Config:
     BATCH_SIZE = 1024
     NUM_WORKERS = 8
     NUM_EPOCHS = 50
-    LEARNING_RATE = 5e-4
+    LEARNING_RATE = 1e-3
     WEIGHT_DECAY = 1e-4
     
     # Imbalance Handling
-    BACKGROUND_KEEP_PROB = 0.20  # Downsample 'no_behavior' to 20% during training
+    BACKGROUND_KEEP_PROB = 0.10  # Downsample 'no_behavior' to 10% during training
 
     # Evaluation
     VAL_SPLIT = 0.10
@@ -502,16 +502,68 @@ class BehaviorClassifier(nn.Module):
 # Training and Evaluation
 # =============================================================================
 
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for addressing class imbalance.
+    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+    """
+    def __init__(self, alpha=None, gamma=2.0, reduction='mean', ignore_index=-1):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        self.ignore_index = ignore_index
+
+    def forward(self, inputs, targets):
+        # inputs: [B*T, C], targets: [B*T]
+        
+        # 1. Compute unweighted Cross Entropy Loss -> -log(pt)
+        ce_loss = F.cross_entropy(
+            inputs, targets, 
+            reduction='none', 
+            ignore_index=self.ignore_index
+        )
+        
+        # 2. Compute pt
+        pt = torch.exp(-ce_loss)
+        
+        # 3. Compute Focal Term: (1 - pt)^gamma
+        focal_term = (1 - pt) ** self.gamma
+        
+        # 4. Compute Base Focal Loss
+        loss = focal_term * ce_loss
+        
+        # 5. Apply Alpha (Class Weights) if provided
+        if self.alpha is not None:
+            # Handle class weights
+            safe_targets = targets.clone()
+            # Replace ignore_index with 0 for valid gathering (loss is already 0 there)
+            if self.ignore_index >= 0:
+                safe_targets[targets == self.ignore_index] = 0
+            
+            alpha_t = self.alpha[safe_targets]
+            loss = loss * alpha_t
+
+        if self.reduction == 'mean':
+            valid_elements = (targets != self.ignore_index).sum()
+            return loss.sum() / (valid_elements + 1e-6)
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+
+
 class Trainer:
     """Handles model training and evaluation."""
     def __init__(self, model, config, class_weights=None):
         self.model = model.to(DEVICE)
         self.config = config
 
-        # Use Standard Cross Entropy with Label Smoothing
-        self.criterion = nn.CrossEntropyLoss(
-            weight=class_weights, 
-            label_smoothing=0.1,
+        # Use Focal Loss without explicit class weights first
+        # relying on gamma=2.0 to handle easy background examples
+        self.criterion = FocalLoss(
+            alpha=None, 
+            gamma=2.0,
             ignore_index=-1
         )
 
@@ -539,10 +591,11 @@ class Trainer:
             sequences, labels = sequences.to(DEVICE), labels.to(DEVICE)
 
             self.optimizer.zero_grad()
-            with autocast():
-                logits = self.model(sequences)
-                B, T, C = logits.shape
-                loss = self.criterion(logits.view(B * T, C), labels.view(B * T))
+            # Disable autocast for stability with small losses
+            # with autocast():
+            logits = self.model(sequences)
+            B, T, C = logits.shape
+            loss = self.criterion(logits.view(B * T, C), labels.view(B * T))
 
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
@@ -738,9 +791,8 @@ def main():
     # 6. Train
     print("\nStarting Training...")
     # Calculate weights based on the downsampled training data
-    # class_weights = processor.compute_class_weights(train_counts)
-    print("WARNING: Disabling class weights to debug exploding loss.")
-    class_weights = None
+    print("Computing class weights...")
+    class_weights = processor.compute_class_weights(train_counts)
     
     trainer = Trainer(model, config, class_weights)
     history = trainer.train(train_loader, val_loader, config.NUM_EPOCHS)
