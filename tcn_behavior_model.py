@@ -1,767 +1,564 @@
-
+# ============================================================
+# tcn_behavior_model_final.py
+# Train TCN on data/processed/train_frames.csv and create
+# submission.csv in the required segment format.
+# ============================================================
 
 import os
+import gc
 import json
+import random
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict
+
 import numpy as np
 import pandas as pd
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional
-from collections import Counter
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.cuda.amp import autocast, GradScaler
 
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import (
-    classification_report, confusion_matrix, f1_score,
-    precision_recall_fscore_support
-)
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-
-import matplotlib.pyplot as plt
-import seaborn as sns
-from tqdm import tqdm
-
-# Set random seeds for reproducibility
-SEED = 32
-torch.manual_seed(SEED)
-np.random.seed(SEED)
-
-# Device configuration
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"Using device: {DEVICE}")
+from sklearn.model_selection import GroupKFold
+from sklearn.preprocessing import LabelEncoder
 
 
-# =============================================================================
-# Configuration
-# =============================================================================
+# ----------------------------
+# Config
+# ----------------------------
 
-class Config:
-    """Configuration for the TCN model and training."""
+@dataclass
+class CFG:
+    # paths
+    train_frames_csv: str = "data/processed/train_frames.csv"
+    test_meta_csv: str = "data/test.csv"  # metadata only; used to get test video_ids
+    proc_dir: str = "data/processed"      # contains preprocessed_<video_id>.parquet for test
+    sample_submission_csv: str = "data/sample_submission.csv"
+    out_dir: str = "outputs"
+    submission_out: str = "outputs/submission.csv"
+    label_map_out: str = "outputs/label_map.json"
 
-    # Data paths
-    DATA_DIR = Path("data/processed/train")
-    OUTPUT_DIR = Path("outputs")
+    # columns
+    id_cols: Tuple[str, ...] = ("video_id", "agent_id", "target_id", "frame")
+    target_col: str = "action"
 
-    # Feature columns (excluding metadata columns)
-    FEATURE_COLS = [
-        'ear_left_x', 'ear_left_y', 'ear_right_x', 'ear_right_y',
-        'tail_base_x', 'tail_base_y', 'nose_x', 'nose_y',
-        'body_elongation', 'velocity_x', 'velocity_y', 'speed',
-        'acceleration', 'heading'
-    ]
+    # windowing
+    window: int = 64
+    stride: int = 16
 
-    # Model architecture
-    # INPUT_DIM will be calculated dynamically
-    NUM_CHANNELS = [64, 64, 128, 128, 256]  # TCN channel sizes
-    KERNEL_SIZE = 5
-    DROPOUT = 0.4
+    # training
+    n_folds: int = 5
+    epochs: int = 8
+    batch_size: int = 128
+    num_workers: int = 0
+    lr: float = 3e-4
+    weight_decay: float = 1e-2
+    seed: int = 42
 
-    # Training
-    SEQUENCE_LENGTH = 120  # Increased temporal window size
-    STRIDE = 32  # Stride for sliding window
-    BATCH_SIZE = 1024
-    NUM_WORKERS = 8
-    NUM_EPOCHS = 50
-    LEARNING_RATE = 5e-4
-    WEIGHT_DECAY = 1e-4
-    
-    # Imbalance Handling
-    BACKGROUND_KEEP_PROB = 0.20  # Downsample 'no_behavior' to 20% during training
+    # model
+    hidden: int = 128
+    dropout: float = 0.1
 
-    # Evaluation
-    VAL_SPLIT = 0.10
-    TEST_SPLIT = 0.10
-
-    # Evaluation
-    VAL_SPLIT = 0.10
-    TEST_SPLIT = 0.10
+    # inference → segments
+    min_segment_len: int = 2  # frames
+    background_labels: Tuple[str, ...] = ("none", "no_action", "background", "other")
 
 
+CFG = CFG()
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# =============================================================================
-# Data Loading and Preprocessing
-# =============================================================================
 
-class BehaviorDataset(Dataset):
-    """Dataset for multi-agent behavior classification."""
+# ----------------------------
+# Reproducibility
+# ----------------------------
 
+def seed_everything(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+# ----------------------------
+# Window builder
+# ----------------------------
+
+def build_windows(df: pd.DataFrame, group_cols: List[str], window: int, stride: int) -> List[Tuple[int, int]]:
+    df = df.sort_values(group_cols + ["frame"]).reset_index(drop=True)
+    windows: List[Tuple[int, int]] = []
+    for _, g in df.groupby(group_cols, sort=False):
+        idx = g.index.to_numpy()
+        if len(idx) < window:
+            continue
+        for i in range(0, len(idx) - window + 1, stride):
+            windows.append((int(idx[i]), int(idx[i + window - 1])))
+    return windows
+
+
+# ----------------------------
+# Dataset
+# ----------------------------
+
+class WindowDataset(Dataset):
     def __init__(
         self,
-        sequences: List[np.ndarray],
-        labels: List[np.ndarray]
+        df: pd.DataFrame,
+        windows: List[Tuple[int, int]],
+        feature_cols: List[str],
+        target_col: Optional[str] = None,
     ):
-        """
-        Args:
-            sequences: List of feature sequences [T, F]
-            labels: List of label sequences [T]
-        """
-        if len(sequences) > 0:
-            print(f"Converting {len(sequences)} sequences to tensors...")
-            self.sequences = torch.FloatTensor(np.array(sequences))
-            self.labels = torch.LongTensor(np.array(labels))
-        else:
-            self.sequences = torch.FloatTensor([])
-            self.labels = torch.LongTensor([])
+        self.df = df
+        self.windows = windows
+        self.feature_cols = feature_cols
+        self.target_col = target_col
 
-    def __len__(self) -> int:
-        return len(self.sequences)
+    def __len__(self):
+        return len(self.windows)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.sequences[idx], self.labels[idx]
+    def __getitem__(self, i):
+        s, e = self.windows[i]
+        x = self.df.loc[s:e, self.feature_cols].to_numpy(np.float32)  # (T,F)
+        if self.target_col is None:
+            return torch.from_numpy(x)
+        y = int(self.df.loc[(s + e) // 2, self.target_col])
+        return torch.from_numpy(x), torch.tensor(y, dtype=torch.long)
 
 
-class DataProcessor:
-    """Handles data loading and preprocessing for behavior classification."""
+# ----------------------------
+# Model (TCN)
+# ----------------------------
 
-    def __init__(self, data_dir: Path, config: Config):
-        self.data_dir = data_dir
-        self.config = config
-        self.scaler = StandardScaler()
-        self.action_to_idx: Dict[str, int] = {}
-        self.idx_to_action: Dict[int, str] = {}
-        self.class_weights: Optional[torch.Tensor] = None
-
-    def load_video_data(self, video_id: str) -> Tuple[pd.DataFrame, pd.DataFrame, dict]:
-        """Load features, annotations, and metadata for a video."""
-        features_path = self.data_dir / f"{video_id}.parquet"
-        annotations_path = self.data_dir / f"{video_id}_annotations.parquet"
-        meta_path = self.data_dir / f"{video_id}_meta.json"
-
-        features = pd.read_parquet(features_path)
-        annotations = pd.read_parquet(annotations_path)
-
-        with open(meta_path, 'r') as f:
-            metadata = json.load(f)
-
-        # Handle missing values with interpolation
-        numeric_cols = features.select_dtypes(include=[np.number]).columns
-        features[numeric_cols] = features[numeric_cols].interpolate(
-            method='linear', limit_direction='both').fillna(0)
-
-        return features, annotations, metadata
-
-    def create_frame_labels(
-        self,
-        features: pd.DataFrame,
-        annotations: pd.DataFrame,
-        num_frames: int
-    ) -> Dict[Tuple[int, int], np.ndarray]:
-        """Create per-frame labels for each agent-target pair."""
-        pair_labels = {}
-
-        for _, row in annotations.iterrows():
-            agent_id = int(row['agent_id'])
-            target_id = int(row['target_id'])
-            action = row['action']
-            start_frame = int(row['start_frame'])
-            stop_frame = int(row['stop_frame'])
-
-            key = (agent_id, target_id)
-            if key not in pair_labels:
-                pair_labels[key] = np.zeros(num_frames, dtype=np.int64)
-
-            if action in self.action_to_idx:
-                action_idx = self.action_to_idx[action]
-                pair_labels[key][start_frame:stop_frame+1] = action_idx
-
-        return pair_labels
-
-    def extract_agent_target_features(
-        self,
-        features: pd.DataFrame,
-        agent_id: int,
-        target_id: int
-    ) -> np.ndarray:
-        """
-        Extract combined features for an agent-target pair.
-        Includes agent features, target features, and relative kinematics.
-        """
-        agent_data = features[features['mouse_id'] == agent_id].sort_values('video_frame')
-        target_data = features[features['mouse_id'] == target_id].sort_values('video_frame')
-
-        if len(agent_data) == 0 or len(target_data) == 0:
-            return None
-
-        # Extract basic features
-        agent_features = agent_data[self.config.FEATURE_COLS].values
-        target_features = target_data[self.config.FEATURE_COLS].values
-
-        # Relative position
-        agent_nose = agent_data[['nose_x', 'nose_y']].values
-        target_nose = target_data[['nose_x', 'nose_y']].values
-        rel_pos = agent_nose - target_nose
-        distance = np.sqrt(np.sum(rel_pos**2, axis=1, keepdims=True))
-
-        # Relative heading
-        agent_heading = agent_data['heading'].values.reshape(-1, 1)
-        target_heading = target_data['heading'].values.reshape(-1, 1)
-        rel_heading = agent_heading - target_heading
-
-        # Relative velocity
-        agent_vel = agent_data[['velocity_x', 'velocity_y']].values
-        target_vel = target_data[['velocity_x', 'velocity_y']].values
-        rel_vel = agent_vel - target_vel
-        rel_speed = np.sqrt(np.sum(rel_vel**2, axis=1, keepdims=True))
-
-        # Body elongation change (derivative)
-        # We compute this simply as diff, prepending 0 for the first frame
-        agent_elongation = agent_data['body_elongation'].values
-        agent_elongation_change = np.diff(agent_elongation, prepend=agent_elongation[0]).reshape(-1, 1)
-
-        # Combine all features
-        combined_features = np.concatenate([
-            agent_features,      # Agent pose + kinematics
-            target_features,     # Target pose + kinematics
-            rel_pos,             # Relative position (x, y)
-            distance,            # Distance
-            rel_heading,         # Relative heading
-            rel_vel,             # Relative velocity (x, y)
-            rel_speed,           # Relative speed
-            agent_elongation_change # Change in body elongation
-        ], axis=1)
-
-        return combined_features
-
-    def create_sequences(
-        self,
-        features: np.ndarray,
-        labels: np.ndarray,
-        downsample: bool
-    ) -> Tuple[List[np.ndarray], List[np.ndarray]]:
-        """
-        Create fixed-length sequences using sliding window.
-        Optionally downsample purely background sequences.
-        """
-        sequences = []
-        label_sequences = []
-        num_frames = len(features)
-
-        for start in range(0, num_frames - self.config.SEQUENCE_LENGTH + 1, self.config.STRIDE):
-            end = start + self.config.SEQUENCE_LENGTH
-            seq = features[start:end]
-            label_seq = labels[start:end]
-
-            # Quality check: Skip sequences with too many NaNs
-            if np.isnan(seq).sum() / seq.size > 0.3:
-                continue
-
-            # Downsampling: If sequence is purely background (0), keep with low probability
-            if downsample and np.all(label_seq == 0):
-                if np.random.random() > self.config.BACKGROUND_KEEP_PROB:
-                    continue
-
-            seq = np.nan_to_num(seq, nan=0.0)
-            sequences.append(seq)
-            label_sequences.append(label_seq)
-
-        return sequences, label_sequences
-
-    def prepare_classes(self, video_files: List[str]) -> None:
-        """Scan all annotations to build the class map."""
-        print("Scanning classes...")
-        all_actions = set()
-        for video_id in tqdm(video_files, desc="Collecting actions"):
-            try:
-                annotations_path = self.data_dir / f"{video_id}_annotations.parquet"
-                if annotations_path.exists():
-                    annotations = pd.read_parquet(annotations_path)
-                    all_actions.update(annotations['action'].unique())
-            except Exception:
-                continue
-
-        all_actions = sorted(list(all_actions))
-        self.action_to_idx = {action: idx + 1 for idx, action in enumerate(all_actions)}
-        self.action_to_idx['no_behavior'] = 0
-        self.idx_to_action = {idx: action for action, idx in self.action_to_idx.items()}
-        print(f"Found {len(all_actions)} behavior classes (+ no_behavior)")
-
-    def process_dataset(
-        self,
-        video_ids: List[str],
-        is_training: bool = False
-    ) -> Tuple[List[np.ndarray], List[np.ndarray], Counter]:
-        """
-        Process a specific list of videos.
-        
-        Args:
-            video_ids: List of video IDs to process
-            is_training: If True, fits scaler and downsamples background
-            
-        Returns:
-            sequences, labels, label_counts
-        """
-        all_sequences = []
-        all_labels = []
-        label_counts = Counter()
-
-        desc = "Processing Train" if is_training else "Processing Eval"
-        
-        for video_id in tqdm(video_ids, desc=desc):
-            try:
-                features, annotations, _ = self.load_video_data(video_id)
-                frames = features['video_frame'].unique()
-                mouse_ids = features['mouse_id'].unique()
-                
-                pair_labels = self.create_frame_labels(features, annotations, len(frames))
-
-                for agent_id in mouse_ids:
-                    for target_id in mouse_ids:
-                        if agent_id == target_id: continue
-                        
-                        # Note: We process all pairs, but only those with annotations
-                        # or valid interactions will effectively have labels.
-                        # If a pair has no annotations, pair_labels[key] creates 0s.
-                        key = (agent_id, target_id)
-                        
-                        # Optimization: Skip pairs that definitely have no interaction 
-                        # if we are just looking for behaviors. 
-                        # But for TCN we need context. 
-                        # Current logic: If create_frame_labels made an entry, use it.
-                        if key not in pair_labels:
-                            continue
-
-                        combined_features = self.extract_agent_target_features(
-                            features, agent_id, target_id
-                        )
-
-                        if combined_features is None:
-                            continue
-
-                        seqs, labs = self.create_sequences(
-                            combined_features,
-                            pair_labels[key],
-                            downsample=is_training
-                        )
-                        
-                        if not seqs:
-                            continue
-                            
-                        # Online scaler fitting (only during training)
-                        if is_training:
-                            flat_seqs = np.concatenate(seqs, axis=0)
-                            self.scaler.partial_fit(flat_seqs)
-
-                        all_sequences.extend(seqs)
-                        all_labels.extend(labs)
-                        
-                        # Count labels (for weighting)
-                        for lab in labs:
-                            label_counts.update(lab.tolist())
-
-            except Exception as e:
-                # print(f"Error processing video {video_id}: {e}")
-                continue
-
-        # Transform all sequences
-        # Note: For training, we fit above. For val/test, we assume scaler is already fit.
-        if all_sequences:
-            print(f"Scaling {len(all_sequences)} sequences...")
-            for i in range(len(all_sequences)):
-                shape = all_sequences[i].shape
-                # Reshape to [N, F] for scaler, then back to [T, F]
-                # Check for infinite values before scaling
-                if not np.isfinite(all_sequences[i]).all():
-                     all_sequences[i] = np.nan_to_num(all_sequences[i], nan=0.0, posinf=0.0, neginf=0.0)
-
-                scaled = self.scaler.transform(all_sequences[i].reshape(-1, shape[-1]))
-                all_sequences[i] = scaled.reshape(shape)
-
-        return all_sequences, all_labels, label_counts
-
-    def compute_class_weights(self, label_counts: Counter) -> torch.Tensor:
-        """
-        Compute class weights using 'balanced' strategy:
-        n_samples / (n_classes * np.bincount(y))
-        """
-        total_samples = sum(label_counts.values())
-        num_classes = len(self.action_to_idx)
-        
-        # Sort counts by class index to ensure correct order
-        counts = np.array([label_counts.get(i, 0) for i in range(num_classes)])
-        
-        # Avoid division by zero
-        counts = np.maximum(counts, 1)
-        
-        # Calculate balanced weights
-        weights = total_samples / (num_classes * counts)
-        
-        # Normalize weights so mean is 1.0 (keeps loss magnitude similar to unweighted)
-        weights = weights / weights.mean()
-        
-        print("Class weights (Balanced & Normalized):")
-        for i, weight in enumerate(weights):
-            if i < 10:
-                print(f"  Class {i}: {weight:.4f} (count={counts[i]})")
-                
-        return torch.FloatTensor(weights).to(DEVICE)
-
-
-# =============================================================================
-# TCN Model Architecture
-# =============================================================================
-
-class CausalConv1d(nn.Module):
-    """Causal 1D convolution with padding to maintain sequence length."""
-    def __init__(self, in_channels, out_channels, kernel_size, dilation=1):
+class TCNBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int, dilation: int, dropout: float):
         super().__init__()
-        self.padding = (kernel_size - 1) * dilation
-        self.conv = nn.Conv1d(
-            in_channels, out_channels, kernel_size,
-            padding=self.padding, dilation=dilation
+        self.conv1 = nn.Conv1d(in_ch, out_ch, kernel_size=3, padding=dilation, dilation=dilation)
+        self.conv2 = nn.Conv1d(out_ch, out_ch, kernel_size=3, padding=dilation, dilation=dilation)
+        self.act = nn.GELU()
+        self.drop = nn.Dropout(dropout)
+        self.res = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+
+    def forward(self, x):
+        # x: (B,C,T)
+        y = self.conv1(x)
+        y = y[..., : x.shape[-1]]
+        y = self.act(y)
+        y = self.drop(y)
+
+        y = self.conv2(y)
+        y = y[..., : x.shape[-1]]
+        y = self.act(y)
+        y = self.drop(y)
+
+        return y + self.res(x)
+
+
+class TCNClassifier(nn.Module):
+    def __init__(self, n_feats: int, n_classes: int, hidden: int, dropout: float):
+        super().__init__()
+        self.net = nn.Sequential(
+            TCNBlock(n_feats, hidden, dilation=1, dropout=dropout),
+            TCNBlock(hidden, hidden, dilation=2, dropout=dropout),
+            TCNBlock(hidden, hidden, dilation=4, dropout=dropout),
+            TCNBlock(hidden, hidden, dilation=8, dropout=dropout),
+        )
+        self.head = nn.Sequential(
+            nn.LayerNorm(hidden),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, n_classes),
         )
 
     def forward(self, x):
-        out = self.conv(x)
-        if self.padding > 0:
-            out = out[:, :, :-self.padding]
+        # x: (B,T,F) -> (B,F,T)
+        x = x.permute(0, 2, 1)
+        h = self.net(x)  # (B,H,T)
+        h = h[:, :, h.shape[-1] // 2]  # center pooling
+        return self.head(h)
+
+
+# ----------------------------
+# Train / eval
+# ----------------------------
+
+def train_one_epoch(model, loader, opt, loss_fn):
+    model.train()
+    total = 0.0
+    n = 0
+    for x, y in loader:
+        x = x.to(DEVICE)
+        y = y.to(DEVICE)
+        opt.zero_grad(set_to_none=True)
+        logits = model(x)
+        loss = loss_fn(logits, y)
+        loss.backward()
+        opt.step()
+        total += float(loss.item()) * x.size(0)
+        n += x.size(0)
+    return total / max(n, 1)
+
+
+@torch.no_grad()
+def predict_proba(model, loader) -> np.ndarray:
+    model.eval()
+    probs = []
+    for batch in loader:
+        if isinstance(batch, (tuple, list)):
+            x = batch[0]
+        else:
+            x = batch
+        x = x.to(DEVICE)
+        logits = model(x)
+        p = torch.softmax(logits, dim=1).cpu().numpy()
+        probs.append(p)
+    return np.concatenate(probs, axis=0)
+
+
+# ----------------------------
+# IO helpers
+# ----------------------------
+
+def ensure_frame_column(df: pd.DataFrame) -> pd.DataFrame:
+    if "frame" in df.columns:
+        return df
+    if df.index.name == "frame":
+        return df.reset_index()
+    df = df.reset_index(drop=True)
+    df["frame"] = df.index
+    return df
+
+
+def load_test_frames_for_video(proc_dir: str, video_id: str) -> pd.DataFrame:
+    # expects preprocessed_<video_id>.parquet
+    path = os.path.join(proc_dir, f"preprocessed_{video_id}.parquet")
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    df = pd.read_parquet(path)
+    df = ensure_frame_column(df)
+
+    # must have agent_id/target_id to match training rows
+    if "agent_id" not in df.columns or "target_id" not in df.columns:
+        raise ValueError(
+            f"{path} must contain agent_id and target_id columns (pair-level features). "
+            f"Found columns: {list(df.columns)[:30]}"
+        )
+
+    df["video_id"] = str(video_id)
+    return df
+
+
+def background_class_ids(le: LabelEncoder, background_labels: Tuple[str, ...]) -> set:
+    s = set()
+    classes = list(le.classes_)
+    for i, c in enumerate(classes):
+        if str(c).lower() in set([b.lower() for b in background_labels]):
+            s.add(i)
+    return s
+
+
+def frames_to_segments(
+    df: pd.DataFrame,
+    action_id_col: str,
+    le: LabelEncoder,
+    min_len: int,
+    bg_ids: set,
+) -> pd.DataFrame:
+    # df includes: video_id, agent_id, target_id, frame, action_id
+    rows = []
+    for (vid, a, t), g in df.sort_values(["video_id", "agent_id", "target_id", "frame"]).groupby(
+        ["video_id", "agent_id", "target_id"], sort=False
+    ):
+        frames = g["frame"].to_numpy()
+        acts = g[action_id_col].to_numpy()
+
+        if len(frames) == 0:
+            continue
+
+        start = int(frames[0])
+        cur = int(acts[0])
+
+        for i in range(1, len(frames)):
+            if int(acts[i]) != cur:
+                stop = int(frames[i - 1])
+                if (stop - start + 1) >= min_len and cur not in bg_ids:
+                    rows.append(
+                        {
+                            "video_id": int(vid) if str(vid).isdigit() else vid,
+                            "agent_id": a,
+                            "target_id": t,
+                            "action": str(le.inverse_transform([cur])[0]),
+                            "start_frame": start,
+                            "stop_frame": stop,
+                        }
+                    )
+                start = int(frames[i])
+                cur = int(acts[i])
+
+        # last segment
+        stop = int(frames[-1])
+        if (stop - start + 1) >= min_len and cur not in bg_ids:
+            rows.append(
+                {
+                    "video_id": int(vid) if str(vid).isdigit() else vid,
+                    "agent_id": a,
+                    "target_id": t,
+                    "action": str(le.inverse_transform([cur])[0]),
+                    "start_frame": start,
+                    "stop_frame": stop,
+                }
+            )
+
+    out = pd.DataFrame(rows)
+    if out.empty:
         return out
 
-
-class TemporalBlock(nn.Module):
-    """Temporal block with dilated causal convolutions and residual connection."""
-    def __init__(self, in_channels, out_channels, kernel_size, dilation, dropout=0.2):
-        super().__init__()
-        self.conv1 = CausalConv1d(in_channels, out_channels, kernel_size, dilation)
-        self.norm1 = nn.BatchNorm1d(out_channels)
-        self.relu = nn.ReLU()
-        self.dropout1 = nn.Dropout(dropout)
-
-        self.conv2 = CausalConv1d(out_channels, out_channels, kernel_size, dilation)
-        self.norm2 = nn.BatchNorm1d(out_channels)
-        self.relu = nn.ReLU()
-        self.dropout2 = nn.Dropout(dropout)
-
-        self.downsample = nn.Conv1d(in_channels, out_channels, 1) \
-            if in_channels != out_channels else None
-
-    def forward(self, x):
-        out = self.conv1(x)
-        out = self.norm1(out)
-        out = self.relu(out)
-        out = self.dropout1(out)
-
-        out = self.conv2(out)
-        out = self.norm2(out)
-        out = self.relu(out)
-        out = self.dropout2(out)
-
-        res = x if self.downsample is None else self.downsample(x)
-        return self.relu(out + res)
+    # sort segments and create row_id
+    out = out.sort_values(["video_id", "agent_id", "target_id", "start_frame"]).reset_index(drop=True)
+    out.insert(0, "row_id", np.arange(len(out), dtype=int))
+    return out
 
 
-class TemporalConvNet(nn.Module):
-    """Temporal Convolutional Network."""
-    def __init__(self, input_dim, num_channels, kernel_size=3, dropout=0.2):
-        super().__init__()
-        layers = []
-        num_levels = len(num_channels)
-        for i in range(num_levels):
-            dilation = 2 ** i
-            in_ch = input_dim if i == 0 else num_channels[i-1]
-            out_ch = num_channels[i]
-            layers.append(TemporalBlock(in_ch, out_ch, kernel_size, dilation, dropout))
-        self.network = nn.Sequential(*layers)
+# ----------------------------
+# Main pipeline
+# ----------------------------
 
-    def forward(self, x):
-        x = x.transpose(1, 2)  # [B, T, F] -> [B, F, T]
-        out = self.network(x)
-        return out.transpose(1, 2)  # [B, F, T] -> [B, T, F]
+def train_cv_and_save(cfg: CFG) -> Dict[str, str]:
+    os.makedirs(cfg.out_dir, exist_ok=True)
+    seed_everything(cfg.seed)
+
+    df = pd.read_csv(cfg.train_frames_csv)
+
+    # enforce ids exist
+    for c in cfg.id_cols:
+        if c not in df.columns:
+            raise ValueError(f"Missing required column in train_frames: {c}")
+
+    # label encode
+    le = LabelEncoder()
+    df["action_id"] = le.fit_transform(df[cfg.target_col].astype(str))
+    n_classes = len(le.classes_)
+
+    # save label map
+    label_map = {int(i): str(lbl) for i, lbl in enumerate(le.classes_)}
+    with open(cfg.label_map_out, "w", encoding="utf-8") as f:
+        json.dump(label_map, f, ensure_ascii=False, indent=2)
+
+    # features: numeric only
+    feature_cols = df.select_dtypes(include=["number"]).columns.tolist()
+
+    # remove non-input numeric columns
+    for c in ["frame", "action_id"]:
+        if c in feature_cols:
+            feature_cols.remove(c)
+
+    if len(feature_cols) == 0:
+        raise ValueError("No numeric feature columns found")
+
+    # hard safety checks
+    assert "bodypart" not in feature_cols
+    assert cfg.target_col not in feature_cols
 
 
-class BehaviorClassifier(nn.Module):
-    """Complete model for behavior classification."""
-    def __init__(self, input_dim, num_classes, num_channels, kernel_size=3, dropout=0.2):
-        super().__init__()
-        self.input_proj = nn.Sequential(
-            nn.Linear(input_dim, num_channels[0]),
-            nn.ReLU(),
-            nn.Dropout(dropout)
-        )
-        self.tcn = TemporalConvNet(num_channels[0], num_channels, kernel_size, dropout)
-        self.classifier = nn.Sequential(
-            nn.Linear(num_channels[-1], num_channels[-1] // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(num_channels[-1] // 2, num_classes)
+    # window index
+    group_cols = ["video_id", "agent_id", "target_id"]
+    windows = build_windows(df, group_cols, cfg.window, cfg.stride)
+    if len(windows) == 0:
+        raise ValueError("No windows built. Check frame continuity and window/stride.")
+
+    # group for CV by video
+    window_video = df.loc[[s for (s, _) in windows], "video_id"].astype(str).to_numpy()
+
+    n_groups = df["video_id"].nunique()
+    n_splits = min(cfg.n_folds, n_groups)
+
+    if n_splits < 2:
+        raise ValueError(
+            f"Need at least 2 videos for GroupKFold, found {n_groups}. "
+            "Preprocess more videos or reduce n_folds."
         )
 
-    def forward(self, x):
-        x = self.input_proj(x)
-        x = self.tcn(x)
-        logits = self.classifier(x)
-        return logits
+    gkf = GroupKFold(n_splits=n_splits)
 
 
-# =============================================================================
-# Training and Evaluation
-# =============================================================================
+    fold_paths = {}
 
-class Trainer:
-    """Handles model training and evaluation."""
-    def __init__(self, model, config, class_weights=None):
-        self.model = model.to(DEVICE)
-        self.config = config
+    for fold, (tr_idx, va_idx) in enumerate(gkf.split(np.arange(len(windows)), groups=window_video)):
+        print(f"\nFOLD {fold}")
 
-        # Use Standard Cross Entropy with Label Smoothing
-        self.criterion = nn.CrossEntropyLoss(
-            weight=class_weights, 
-            label_smoothing=0.1,
-            ignore_index=-1
-        )
+        tr_w = [windows[i] for i in tr_idx]
+        va_w = [windows[i] for i in va_idx]
 
-        self.optimizer = AdamW(
-            model.parameters(),
-            lr=config.LEARNING_RATE,
-            weight_decay=config.WEIGHT_DECAY
-        )
-        self.scheduler = CosineAnnealingLR(
-            self.optimizer, T_max=config.NUM_EPOCHS, eta_min=1e-6
-        )
-        self.scaler = GradScaler()
-        self.history = {
-            'train_loss': [], 'val_loss': [], 
-            'train_f1': [], 'val_f1': [], 
-            'learning_rates': []
-        }
+        ds_tr = WindowDataset(df, tr_w, feature_cols, target_col="action_id")
+        ds_va = WindowDataset(df, va_w, feature_cols, target_col="action_id")
 
-    def train_epoch(self, dataloader):
-        self.model.train()
-        total_loss = 0.0
-        all_preds, all_labels = [], []
+        dl_tr = DataLoader(ds_tr, batch_size=cfg.batch_size, shuffle=True, num_workers=cfg.num_workers)
+        dl_va = DataLoader(ds_va, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers)
 
-        for sequences, labels in tqdm(dataloader, desc="Training", leave=False):
-            sequences, labels = sequences.to(DEVICE), labels.to(DEVICE)
+        model = TCNClassifier(len(feature_cols), n_classes, hidden=cfg.hidden, dropout=cfg.dropout).to(DEVICE)
+        opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+        loss_fn = nn.CrossEntropyLoss()
 
-            self.optimizer.zero_grad()
-            with autocast():
-                logits = self.model(sequences)
-                B, T, C = logits.shape
-                loss = self.criterion(logits.view(B * T, C), labels.view(B * T))
+        best_loss = float("inf")
+        best_state = None
 
-            self.scaler.scale(loss).backward()
-            self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+        for ep in range(cfg.epochs):
+            tr_loss = train_one_epoch(model, dl_tr, opt, loss_fn)
+            # validation loss proxy (no metric dependency)
+            model.eval()
+            val_losses = []
+            with torch.no_grad():
+                for x, y in dl_va:
+                    x = x.to(DEVICE)
+                    y = y.to(DEVICE)
+                    logits = model(x)
+                    loss = loss_fn(logits, y)
+                    val_losses.append(float(loss.item()))
+            va_loss = float(np.mean(val_losses)) if val_losses else float("inf")
 
-            total_loss += loss.item()
-            preds = logits.argmax(dim=-1).detach().cpu().numpy()
-            all_preds.extend(preds.flatten())
-            all_labels.extend(labels.cpu().numpy().flatten())
+            print(f"epoch {ep+1:02d} | train_loss {tr_loss:.4f} | val_loss {va_loss:.4f}")
 
-        avg_loss = total_loss / len(dataloader)
-        f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
-        return avg_loss, f1
+            if va_loss < best_loss:
+                best_loss = va_loss
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
-    @torch.no_grad()
-    def evaluate(self, dataloader):
-        self.model.eval()
-        total_loss = 0.0
-        all_preds, all_labels = [], []
+        # save fold weights
+        fold_path = os.path.join(cfg.out_dir, f"tcn_fold_{fold}.pt")
+        torch.save(best_state, fold_path)
+        fold_paths[str(fold)] = fold_path
+        print("saved", fold_path)
 
-        for sequences, labels in tqdm(dataloader, desc="Evaluating", leave=False):
-            sequences, labels = sequences.to(DEVICE), labels.to(DEVICE)
-            logits = self.model(sequences)
-            B, T, C = logits.shape
-            loss = self.criterion(logits.view(B * T, C), labels.view(B * T))
-            total_loss += loss.item()
-            preds = logits.argmax(dim=-1).cpu().numpy()
-            all_preds.extend(preds.flatten())
-            all_labels.extend(labels.cpu().numpy().flatten())
+        del model, ds_tr, ds_va, dl_tr, dl_va
+        gc.collect()
+        torch.cuda.empty_cache()
 
-        avg_loss = total_loss / len(dataloader) if len(dataloader) > 0 else 0
-        f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
-        return avg_loss, f1, np.array(all_preds), np.array(all_labels)
-
-    def train(self, train_loader, val_loader, num_epochs):
-        best_val_f1 = 0.0
-        best_model_state = None
-
-        for epoch in range(num_epochs):
-            print(f"\nEpoch {epoch + 1}/{num_epochs}")
-            print("-" * 50)
-
-            train_loss, train_f1 = self.train_epoch(train_loader)
-            
-            if (epoch + 1) % 5 == 0:
-                val_loss, val_f1, _, _ = self.evaluate(val_loader)
-                if val_f1 > best_val_f1:
-                    best_val_f1 = val_f1
-                    best_model_state = self.model.state_dict().copy()
-                    print(f"New best model! Val F1: {best_val_f1:.4f}")
-            else:
-                val_loss, val_f1 = np.nan, np.nan
-
-            self.scheduler.step()
-            current_lr = self.scheduler.get_last_lr()[0]
-            
-            self.history['train_loss'].append(train_loss)
-            self.history['val_loss'].append(val_loss)
-            self.history['train_f1'].append(train_f1)
-            self.history['val_f1'].append(val_f1)
-            self.history['learning_rates'].append(current_lr)
-
-            print(f"Train Loss: {train_loss:.4f} | Train F1: {train_f1:.4f}")
-            if not np.isnan(val_loss):
-                print(f"Val Loss: {val_loss:.4f} | Val F1: {val_f1:.4f}")
-            print(f"Learning Rate: {current_lr:.6f}")
-
-        if best_model_state is not None:
-            self.model.load_state_dict(best_model_state)
-        return self.history
+    return {
+        "label_map": cfg.label_map_out,
+        "fold_paths": fold_paths,
+        "train_frames": cfg.train_frames_csv,
+    }
 
 
-# =============================================================================
-# Visualization
-# =============================================================================
+def infer_and_write_submission(cfg: CFG):
+    os.makedirs(cfg.out_dir, exist_ok=True)
 
-class Visualizer:
-    """Handles visualization of results."""
-    def __init__(self, output_dir: Path, idx_to_action: Dict[int, str]):
-        self.output_dir = output_dir
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.idx_to_action = idx_to_action
+    # load label map and rebuild encoder in the same order
+    with open(cfg.label_map_out, "r", encoding="utf-8") as f:
+        label_map = json.load(f)
+    # label_map keys are ints as strings
+    classes = [label_map[str(i)] for i in range(len(label_map))]
+    le = LabelEncoder()
+    le.fit(classes)
 
-    def plot_training_history(self, history: Dict) -> None:
-        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-        
-        # Filter NaNs for plotting
-        val_loss = [x for x in history['val_loss'] if not np.isnan(x)]
-        val_f1 = [x for x in history['val_f1'] if not np.isnan(x)]
-        val_epochs = [i for i, x in enumerate(history['val_loss']) if not np.isnan(x)]
+    bg_ids = background_class_ids(le, cfg.background_labels)
 
-        axes[0].plot(history['train_loss'], label='Train')
-        if val_loss:
-            axes[0].plot(val_epochs, val_loss, label='Validation', marker='o')
-        axes[0].set_title('Training Loss')
-        axes[0].legend()
+    # discover folds
+    fold_paths = []
+    for fold in range(cfg.n_folds):
+        p = os.path.join(cfg.out_dir, f"tcn_fold_{fold}.pt")
+        if os.path.exists(p):
+            fold_paths.append(p)
+    if len(fold_paths) == 0:
+        raise FileNotFoundError("No fold weights found in outputs/. Train first.")
 
-        axes[1].plot(history['train_f1'], label='Train')
-        if val_f1:
-            axes[1].plot(val_epochs, val_f1, label='Validation', marker='o')
-        axes[1].set_title('Macro F1 Score')
-        axes[1].legend()
+    # get test videos from metadata
+    test_meta = pd.read_csv(cfg.test_meta_csv)
+    if "video_id" not in test_meta.columns:
+        raise ValueError("data/test.csv must contain a video_id column")
+    test_video_ids = test_meta["video_id"].astype(str).tolist()
 
-        axes[2].plot(history['learning_rates'])
-        axes[2].set_title('Learning Rate')
-        
-        plt.tight_layout()
-        plt.savefig(self.output_dir / 'training_history.png')
-        plt.close()
+    # build per-frame predictions for each test video, then segments
+    all_frame_preds = []
 
-    def save_classification_report(self, y_true, y_pred) -> str:
-        unique_labels = sorted(set(y_true) | set(y_pred))
-        label_names = [self.idx_to_action.get(i, f'class_{i}') for i in unique_labels]
-        report = classification_report(
-            y_true, y_pred, labels=unique_labels, target_names=label_names, zero_division=0
-        )
-        with open(self.output_dir / 'classification_report.txt', 'w') as f:
-            f.write(report)
-        return report
+    # rebuild feature_cols exactly as in training
+    train_df = pd.read_csv(cfg.train_frames_csv, nrows=1000)
+    feature_cols = train_df.select_dtypes(include=["number"]).columns.tolist()
+    for c in ["frame", "action_id"]:
+        if c in feature_cols:
+            feature_cols.remove(c)
 
 
-# =============================================================================
-# Main Execution
-# =============================================================================
+    n_classes = len(le.classes_)
 
-def main():
-    print("=" * 60)
-    print("TCN Behavior Classification Model - Improved")
-    print("MABe Challenge 2025")
-    print("=" * 60)
+    for vid in test_video_ids:
+        feat = load_test_frames_for_video(cfg.proc_dir, vid)
 
-    config = Config()
-    config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    processor = DataProcessor(config.DATA_DIR, config)
+        # keep only required ids + features
+        missing = [c for c in feature_cols if c not in feat.columns]
+        if missing:
+            raise ValueError(f"Missing feature columns in test preprocessed_{vid}.parquet: {missing[:15]}")
 
-    # 1. Get all videos and prepare classes
-    video_files = [f.stem for f in config.DATA_DIR.glob("*.parquet") if '_' not in f.stem]
-    if not video_files:
-        print("No data found!")
+        # build windows on test
+        group_cols = ["video_id", "agent_id", "target_id"]
+        windows = build_windows(feat, group_cols, cfg.window, cfg.stride)
+        if len(windows) == 0:
+            continue
+
+        ds = WindowDataset(feat, windows, feature_cols, target_col=None)
+        dl = DataLoader(ds, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers)
+
+        # ensemble over folds
+        probs_sum = None
+        for pth in fold_paths:
+            model = TCNClassifier(len(feature_cols), n_classes, hidden=cfg.hidden, dropout=cfg.dropout).to(DEVICE)
+            state = torch.load(pth, map_location="cpu")
+            model.load_state_dict(state, strict=True)
+            pr = predict_proba(model, dl)
+            probs_sum = pr if probs_sum is None else (probs_sum + pr)
+            del model
+            torch.cuda.empty_cache()
+
+        probs = probs_sum / len(fold_paths)
+
+        # assign each window prediction to its center frame row
+        centers = np.array([(s + e) // 2 for (s, e) in windows], dtype=int)
+        center_rows = feat.loc[centers, ["video_id", "agent_id", "target_id", "frame"]].copy()
+        action_id = probs.argmax(axis=1).astype(int)
+        center_rows["action_id"] = action_id
+
+        all_frame_preds.append(center_rows)
+
+    if len(all_frame_preds) == 0:
+        # still write an empty, schema-correct submission
+        sub = pd.read_csv(cfg.sample_submission_csv).iloc[0:0].copy()
+        sub.to_csv(cfg.submission_out, index=False)
+        print("No predictions generated; wrote empty submission:", cfg.submission_out)
         return
 
-    processor.prepare_classes(video_files)
-    num_classes = len(processor.action_to_idx)
-    
-    # 2. Split videos FIRST
-    print("\n[Split] Splitting videos into Train/Val/Test...")
-    train_vids, test_vids = train_test_split(video_files, test_size=config.VAL_SPLIT + config.TEST_SPLIT, random_state=SEED)
-    val_vids, test_vids = train_test_split(test_vids, test_size=0.5, random_state=SEED) # Equal split for val/test
-    
-    print(f"Train videos: {len(train_vids)}")
-    print(f"Val videos:   {len(val_vids)}")
-    print(f"Test videos:  {len(test_vids)}")
+    frame_pred_df = pd.concat(all_frame_preds, ignore_index=True)
 
-    # 3. Process datasets independently
-    # Train: Fit scaler, downsample background
-    print("\n[Train Data] Processing...")
-    train_seqs, train_labels, train_counts = processor.process_dataset(train_vids, is_training=True)
-    
-    # Val/Test: Transform scaler, keep all data
-    print("\n[Val Data] Processing...")
-    val_seqs, val_labels, _ = processor.process_dataset(val_vids, is_training=False)
-    
-    print("\n[Test Data] Processing...")
-    test_seqs, test_labels, _ = processor.process_dataset(test_vids, is_training=False)
-
-    if len(train_seqs) == 0:
-        print("Error: No training data generated.")
-        return
-
-    # 4. Create Datasets and Loaders
-    train_dataset = BehaviorDataset(train_seqs, train_labels)
-    val_dataset = BehaviorDataset(val_seqs, val_labels)
-    test_dataset = BehaviorDataset(test_seqs, test_labels)
-
-    train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, num_workers=config.NUM_WORKERS)
-    val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=config.NUM_WORKERS)
-    test_loader = DataLoader(test_dataset, batch_size=config.BATCH_SIZE, shuffle=False, num_workers=config.NUM_WORKERS)
-
-    # 5. Initialize Model
-    input_dim = train_seqs[0].shape[1]
-    print(f"\nInput dimension: {input_dim}")
-    
-    model = BehaviorClassifier(
-        input_dim=input_dim,
-        num_classes=num_classes,
-        num_channels=config.NUM_CHANNELS,
-        kernel_size=config.KERNEL_SIZE,
-        dropout=config.DROPOUT
+    # convert frame predictions → segments (matches sample_submission schema)
+    seg_df = frames_to_segments(
+        frame_pred_df,
+        action_id_col="action_id",
+        le=le,
+        min_len=cfg.min_segment_len,
+        bg_ids=bg_ids,
     )
 
-    # 6. Train
-    print("\nStarting Training...")
-    # Calculate weights based on the downsampled training data
-    # class_weights = processor.compute_class_weights(train_counts)
-    print("WARNING: Disabling class weights to debug exploding loss.")
-    class_weights = None
-    
-    trainer = Trainer(model, config, class_weights)
-    history = trainer.train(train_loader, val_loader, config.NUM_EPOCHS)
+    # align to exact column order
+    if seg_df.empty:
+        sub = pd.read_csv(cfg.sample_submission_csv).iloc[0:0].copy()
+        sub.to_csv(cfg.submission_out, index=False)
+        print("Only background predicted; wrote empty submission:", cfg.submission_out)
+        return
 
-    # 7. Save
-    model_path = config.OUTPUT_DIR / 'tcn_behavior_model.pt'
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'config': vars(config),
-        'action_to_idx': processor.action_to_idx
-    }, model_path)
-    
-    # 8. Evaluate
-    print("\nFinal Evaluation on Test Set...")
-    _, test_f1, test_preds, test_true = trainer.evaluate(test_loader)
-    print(f"Test Macro F1: {test_f1:.4f}")
-    
-    visualizer = Visualizer(config.OUTPUT_DIR, processor.idx_to_action)
-    visualizer.plot_training_history(history)
-    print(visualizer.save_classification_report(test_true, test_preds))
+    # Ensure same columns as sample
+    sample = pd.read_csv(cfg.sample_submission_csv)
+    out = seg_df.copy()
+
+    # If sample has stricter dtypes, keep columns only
+    out = out[sample.columns.tolist()]
+
+    out.to_csv(cfg.submission_out, index=False)
+    print("Wrote submission:", cfg.submission_out, "rows:", len(out))
+
+
+def main():
+    # Train if fold weights missing; always attempt submission after training
+    os.makedirs(CFG.out_dir, exist_ok=True)
+    need_train = any(not os.path.exists(os.path.join(CFG.out_dir, f"tcn_fold_{f}.pt")) for f in range(CFG.n_folds))
+    if need_train:
+        train_cv_and_save(CFG)
+    infer_and_write_submission(CFG)
 
 
 if __name__ == "__main__":
     main()
+
